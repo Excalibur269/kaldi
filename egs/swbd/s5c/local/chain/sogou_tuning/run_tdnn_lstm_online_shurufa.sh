@@ -1,0 +1,1 @@
+tdnn_lstm_tuning/run_tdnn_lstm_sogou_60M_LFR_noLD_4w5.sh

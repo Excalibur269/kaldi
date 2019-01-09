@@ -1,0 +1,1 @@
+tdnnf_tuning/run_tdnnf_1a_7300h_1536_160_L2-0.001.sh
