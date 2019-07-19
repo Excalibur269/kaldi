@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2017  Vimal Manohar
 # Apache 2.0
@@ -16,7 +16,6 @@ The column dimension is num-sources * dim, which dim is specified by --dim
 option.
 """
 
-from __future__ import print_function
 import argparse
 import logging
 import numpy as np
@@ -110,7 +109,7 @@ def should_remove_frame(row, dim):
                                      # source[2] = [ 0 0 0 ]
     """
     assert len(row) % dim == 0
-    num_sources = len(row) / dim
+    num_sources = len(row) // dim
 
     max_idx = np.argmax(row)
     max_val = row[max_idx]
@@ -120,7 +119,7 @@ def should_remove_frame(row, dim):
         # Remove frame.
         return True
 
-    best_source = max_idx / dim
+    best_source = max_idx // dim
     best_class = max_idx % dim
 
     confident_in_source = []  # List of length num_sources
@@ -171,7 +170,7 @@ def run(args):
                     "is not a multiple of dim {dim}"
                     "".format(utt=key, f=args.pasted_targets.name,
                               nc=mat.shape[1], dim=args.dim))
-            num_sources = mat.shape[1] / args.dim
+            num_sources = mat.shape[1] // args.dim
 
             out_mat = np.matrix(np.zeros([mat.shape[0], args.dim]))
 

@@ -22,7 +22,7 @@ EXTRA_LDLIBS += -lkaldi-online -lkaldi-lat -lkaldi-decoder -lkaldi-feat -lkaldi-
 
 OBJFILES = gst-audio-source.o gst-online-gmm-decode-faster.o
 
-LIBNAME=gstkaldi
+LIBNAME=gstonlinegmmdecodefaster
 
 LIBFILE = lib$(LIBNAME).so
 BINFILES= $(LIBFILE)
@@ -32,11 +32,6 @@ all: $(LIBFILE)
 EXTRA_LDLIBS += ../../tools/portaudio/install/lib/libportaudio.a
 ifneq ($(wildcard ../../tools/portaudio/install/include/pa_linux_alsa.h),)
     EXTRA_LDLIBS += -lasound
-endif
-
-# MKL libs required when linked via shared library
-ifdef MKLROOT
-	EXTRA_LDLIBS+=-lmkl_p4n -lmkl_def
 endif
 
 # Library so name and rpath

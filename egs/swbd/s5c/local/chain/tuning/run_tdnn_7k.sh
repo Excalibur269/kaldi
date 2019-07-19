@@ -35,7 +35,7 @@ num_jobs_initial=3
 num_jobs_final=16
 minibatch_size=128
 frames_per_eg=150
-remove_egs=false
+remove_egs=true
 common_egs_dir=
 xent_regularize=0.1
 
@@ -114,7 +114,7 @@ if [ $stage -le 12 ]; then
   echo "$0: creating neural net configs using the xconfig parser";
 
   num_targets=$(tree-info $treedir/tree |grep num-pdfs|awk '{print $2}')
-  learning_rate_factor=$(echo "print 0.5/$xent_regularize" | python)
+  learning_rate_factor=$(echo "print (0.5/$xent_regularize)" | python)
 
   mkdir -p $dir/configs
   cat <<EOF > $dir/configs/network.xconfig

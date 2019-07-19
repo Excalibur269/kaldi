@@ -33,16 +33,15 @@ NnetChainTrainer::NnetChainTrainer(const NnetChainTrainingOptions &opts,
     compiler_(*nnet, opts_.nnet_config.optimize_config,
               opts_.nnet_config.compiler_config),
     num_minibatches_processed_(0),
+    max_change_stats_(*nnet),
     srand_seed_(RandInt(0, 100000)) {
   if (opts.nnet_config.zero_component_stats)
     ZeroComponentStats(nnet);
   KALDI_ASSERT(opts.nnet_config.momentum >= 0.0 &&
-               opts.nnet_config.max_param_change >= 0.0);
+               opts.nnet_config.max_param_change >= 0.0 &&
+               opts.nnet_config.backstitch_training_interval > 0);
   delta_nnet_ = nnet_->Copy();
   ScaleNnet(0.0, delta_nnet_);
-  const int32 num_updatable = NumUpdatableComponents(*delta_nnet_);
-  num_max_change_per_component_applied_.resize(num_updatable, 0);
-  num_max_change_global_applied_ = 0;
 
   if (opts.nnet_config.read_cache != "") {
     bool binary;
@@ -67,7 +66,7 @@ void NnetChainTrainer::Train(const NnetChainExample &chain_eg) {
                              nnet_config.store_component_stats,
                              use_xent_regularization, need_model_derivative,
                              &request);
-  const NnetComputation *computation = compiler_.Compile(request);
+  std::shared_ptr<const NnetComputation> computation = compiler_.Compile(request);
 
   if (nnet_config.backstitch_training_scale > 0.0 && num_minibatches_processed_
       % nnet_config.backstitch_training_interval ==
@@ -87,15 +86,22 @@ void NnetChainTrainer::Train(const NnetChainExample &chain_eg) {
   } else { // conventional training
     TrainInternal(chain_eg, *computation);
   }
-
+  if (num_minibatches_processed_ == 0) {
+    ConsolidateMemory(nnet_);
+    ConsolidateMemory(delta_nnet_);
+  }
   num_minibatches_processed_++;
 }
 
 void NnetChainTrainer::TrainInternal(const NnetChainExample &eg,
                                      const NnetComputation &computation) {
   const NnetTrainerOptions &nnet_config = opts_.nnet_config;
+  // note: because we give the 1st arg (nnet_) as a pointer to the
+  // constructor of 'computer', it will use that copy of the nnet to
+  // store stats.
   NnetComputer computer(nnet_config.compute_config, computation,
-                        *nnet_, delta_nnet_);
+                        nnet_, delta_nnet_);
+
   // give the inputs to the computer object.
   computer.AcceptInputs(*nnet_, eg.inputs);
   computer.Run();
@@ -103,11 +109,29 @@ void NnetChainTrainer::TrainInternal(const NnetChainExample &eg,
   this->ProcessOutputs(false, eg, &computer);
   computer.Run();
 
+  // If relevant, add in the part of the gradient that comes from
+  // parameter-level L2 regularization.
+  ApplyL2Regularization(*nnet_,
+                        GetNumNvalues(eg.inputs, false) *
+                        nnet_config.l2_regularize_factor,
+                        delta_nnet_);
+
   // Updates the parameters of nnet
-  bool success = UpdateNnetWithMaxChange(*delta_nnet_,
-      nnet_config.max_param_change, 1.0, 1.0 - nnet_config.momentum, nnet_,
-      &num_max_change_per_component_applied_, &num_max_change_global_applied_);
-  // Scales delta_nnet
+  bool success = UpdateNnetWithMaxChange(
+      *delta_nnet_,
+      nnet_config.max_param_change,
+      1.0, 1.0 - nnet_config.momentum, nnet_,
+      &max_change_stats_);
+
+  // Scale down the batchnorm stats (keeps them fresh... this affects what
+  // happens when we use the model with batchnorm test-mode set).
+  ScaleBatchnormStats(nnet_config.batchnorm_stats_scale, nnet_);
+
+  // The following will only do something if we have a LinearComponent
+  // or AffineComponent with orthonormal-constraint set to a nonzero value.
+  ConstrainOrthonormal(nnet_);
+
+  // Scale delta_nnet
   if (success)
     ScaleNnet(nnet_config.momentum, delta_nnet_);
   else
@@ -118,8 +142,11 @@ void NnetChainTrainer::TrainInternalBackstitch(const NnetChainExample &eg,
                                                const NnetComputation &computation,
                                                bool is_backstitch_step1) {
   const NnetTrainerOptions &nnet_config = opts_.nnet_config;
+  // note: because we give the 1st arg (nnet_) as a pointer to the
+  // constructor of 'computer', it will use that copy of the nnet to
+  // store stats.
   NnetComputer computer(nnet_config.compute_config, computation,
-                        *nnet_, delta_nnet_);
+                        nnet_, delta_nnet_);
   // give the inputs to the computer object.
   computer.AcceptInputs(*nnet_, eg.inputs);
   computer.Run();
@@ -139,13 +166,36 @@ void NnetChainTrainer::TrainInternalBackstitch(const NnetChainExample &eg,
     // delta_nnet is scaled by 1 + backstitch_training_scale when added to nnet;
     max_change_scale = 1.0 + nnet_config.backstitch_training_scale;
     scale_adding = 1.0 + nnet_config.backstitch_training_scale;
+    // If relevant, add in the part of the gradient that comes from L2
+    // regularization.  It may not be optimally inefficient to do it on both
+    // passes of the backstitch, like we do here, but it probably minimizes
+    // any harmful interactions with the max-change.
+    ApplyL2Regularization(*nnet_,
+        1.0 / scale_adding * GetNumNvalues(eg.inputs, false) *
+        nnet_config.l2_regularize_factor, delta_nnet_);
   }
 
   // Updates the parameters of nnet
-  UpdateNnetWithMaxChange(*delta_nnet_,
-      nnet_config.max_param_change, max_change_scale, scale_adding, nnet_,
-      &num_max_change_per_component_applied_, &num_max_change_global_applied_);
-  
+  UpdateNnetWithMaxChange(
+      *delta_nnet_, nnet_config.max_param_change,
+      max_change_scale, scale_adding, nnet_,
+      &max_change_stats_);
+
+  if (is_backstitch_step1) {
+    // The following will only do something if we have a LinearComponent or
+    // AffineComponent with orthonormal-constraint set to a nonzero value. We
+    // choose to do this only on the 1st backstitch step, for efficiency.
+    ConstrainOrthonormal(nnet_);
+  }
+
+  if (!is_backstitch_step1) {
+    // Scale down the batchnorm stats (keeps them fresh... this affects what
+    // happens when we use the model with batchnorm test-mode set).  Do this
+    // after backstitch step 2 so that the stats are scaled down before we start
+    // the next minibatch.
+    ScaleBatchnormStats(nnet_config.batchnorm_stats_scale, nnet_);
+  }
+
   ScaleNnet(0.0, delta_nnet_);
 }
 
@@ -174,9 +224,6 @@ void NnetChainTrainer::ProcessOutputs(bool is_backstitch_step2,
     bool use_xent = (opts_.chain_config.xent_regularize != 0.0);
     std::string xent_name = sup.name + "-xent";  // typically "output-xent".
     CuMatrix<BaseFloat> xent_deriv;
-    if (use_xent)
-      xent_deriv.Resize(nnet_output.NumRows(), nnet_output.NumCols(),
-                        kUndefined);
 
     BaseFloat tot_objf, tot_l2_term, tot_weight;
 
@@ -230,39 +277,8 @@ bool NnetChainTrainer::PrintTotalStats() const {
     const ObjectiveFunctionInfo &info = iter->second;
     ans = info.PrintTotalStats(name) || ans;
   }
-  PrintMaxChangeStats();
+  max_change_stats_.Print(*nnet_);
   return ans;
-}
-
-void NnetChainTrainer::PrintMaxChangeStats() const {
-  KALDI_ASSERT(delta_nnet_ != NULL);
-  const NnetTrainerOptions &nnet_config = opts_.nnet_config;
-  int32 i = 0;
-  for (int32 c = 0; c < delta_nnet_->NumComponents(); c++) {
-    Component *comp = delta_nnet_->GetComponent(c);
-    if (comp->Properties() & kUpdatableComponent) {
-      UpdatableComponent *uc = dynamic_cast<UpdatableComponent*>(comp);
-      if (uc == NULL)
-        KALDI_ERR << "Updatable component does not inherit from class "
-                  << "UpdatableComponent; change this code.";
-      if (num_max_change_per_component_applied_[i] > 0)
-        KALDI_LOG << "For " << delta_nnet_->GetComponentName(c)
-                  << ", per-component max-change was enforced "
-                  << (100.0 * num_max_change_per_component_applied_[i]) /
-                     (num_minibatches_processed_ *
-                     (nnet_config.backstitch_training_scale == 0.0 ? 1.0 :
-                     1.0 + 1.0 / nnet_config.backstitch_training_interval))
-                  << " \% of the time.";
-      i++;
-    }
-  }
-  if (num_max_change_global_applied_ > 0)
-    KALDI_LOG << "The global max-change was enforced "
-              << (100.0 * num_max_change_global_applied_) /
-                 (num_minibatches_processed_ *
-                 (nnet_config.backstitch_training_scale == 0.0 ? 1.0 : 
-                 1.0 + 1.0 / nnet_config.backstitch_training_interval))
-              << " \% of the time.";
 }
 
 NnetChainTrainer::~NnetChainTrainer() {

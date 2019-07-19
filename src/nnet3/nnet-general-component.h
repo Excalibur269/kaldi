@@ -65,7 +65,7 @@ class DistributeComponent: public Component {
   // use the default Info() function.
   virtual void InitFromConfig(ConfigLine *cfl);
   virtual std::string Type() const { return "DistributeComponent"; }
-  virtual int32 Properties() const { return kLinearInInput; }
+  virtual int32 Properties() const { return 0; }
   virtual void* Propagate(const ComponentPrecomputedIndexes *indexes,
                          const CuMatrixBase<BaseFloat> &in,
                          CuMatrixBase<BaseFloat> *out) const;
@@ -281,7 +281,7 @@ class StatisticsExtractionComponentPrecomputedIndexes:
   // element is a (start, end) range of inputs, that is summed over.
   CuArray<Int32Pair> forward_indexes;
 
-  // this vector stores the number of inputs for each output.  Normally this will be
+  // This vector stores the number of inputs for each output.  Normally this will be
   // the same as the component's output_period_ / input_period_, but could be less
   // due to edge effects at the utterance boundary.
   CuVector<BaseFloat> counts;
@@ -475,7 +475,7 @@ class BackpropTruncationComponent: public Component {
   virtual std::string Type() const { return "BackpropTruncationComponent"; }
 
   virtual int32 Properties() const {
-    return kLinearInInput|kPropagateInPlace|kBackpropInPlace;
+    return kPropagateInPlace|kBackpropInPlace;
   }
 
   virtual void ZeroStats();
@@ -587,12 +587,31 @@ class BackpropTruncationComponentPrecomputedIndexes:
 };
 
 
-// ConstantComponent returns a constant value for all requested
-// indexes, and it has no dependencies on any input.
-// It's like a ConstantFunctionComponent, but done the "right"
-// way without requiring an unnecessary input.
-// It is optionally trainable, and optionally you can use natural
-// gradient.
+/*
+   ConstantComponent returns a constant value for all requested
+   indexes, and it has no dependencies on any input.
+   It's like a ConstantFunctionComponent, but done the "right"
+   way without requiring an unnecessary input.
+   It is optionally trainable, and optionally you can use natural
+   gradient.
+
+   Configuration values accepted by this component, with defaults if
+   applicable:
+
+      output-dim              Dimension that this component outputs.
+      is-updatable=true       True if you want this to be updatable.
+      use-natural-gradient=true  True if you want the update to use natural gradient.
+      output-mean=0.0         Mean of the parameters at initialization (the parameters
+                              are what it outputs).
+      output-stddev=0.0       Standard deviation of the parameters at initialization.
+
+
+  Values inherited from UpdatableComponent (see its declaration in
+  nnet-component-itf for details):
+     learning-rate
+     learning-rate-factor
+     max-change
+*/
 class ConstantComponent: public UpdatableComponent {
  public:
   // actually this component requires no inputs; this value
@@ -615,7 +634,7 @@ class ConstantComponent: public UpdatableComponent {
   virtual std::string Type() const { return "ConstantComponent"; }
   virtual int32 Properties() const {
     return
-        (is_updatable_ ? kUpdatableComponent|kLinearInParameters : 0);
+        (is_updatable_ ? kUpdatableComponent : 0);
   }
   virtual void* Propagate(const ComponentPrecomputedIndexes *indexes,
                          const CuMatrixBase<BaseFloat> &in,
@@ -660,6 +679,8 @@ class ConstantComponent: public UpdatableComponent {
   virtual int32 NumParameters() const;
   virtual void Vectorize(VectorBase<BaseFloat> *params) const;
   virtual void UnVectorize(const VectorBase<BaseFloat> &params);
+
+  virtual void ConsolidateMemory();
  private:
 
   // the output value-- a vector.
@@ -696,7 +717,12 @@ class DropoutMaskComponent: public RandomComponent {
   virtual std::string Info() const;
 
   // possible parameter values with their defaults:
-  // dropout-proportion=0.5 output-dim=-1
+  // dropout-proportion=0.5 output-dim=-1 continuous=false
+  // With the 'continous=false' option (the default), it generates
+  // 0 with probability 'dropout-proportion' and 1 otherwise.
+  // With 'continuous=true' it outputs 1 plus dropout-proportion times
+  //  a value uniformly distributed on [-2, 2].  (e.g. if dropout-proportion is
+  // 0.5, this would amount to a value uniformly distributed on [0,2].)
   virtual void InitFromConfig(ConfigLine *cfl);
 
   DropoutMaskComponent();
@@ -752,9 +778,326 @@ class DropoutMaskComponent: public RandomComponent {
 
   BaseFloat dropout_proportion_;
 
+  bool continuous_;
+
   const DropoutMaskComponent &operator
   = (const DropoutMaskComponent &other); // Disallow.
 };
+
+
+
+/**
+   GeneralDropoutComponent implements dropout, including a continuous
+   variant where the thing we multiply is not just zero or one, but may
+   be a continuous value.  It is intended for the case where you want to
+   either share the dropout mask across all of time, or across groups
+   of 't' values (e.g. the first block of 10 values gets one dropout
+   mask, the second block of 10 gets another one, and so on).
+
+   It also has support for the frequency component of SpecAugment.
+
+   Configuration values accepted on the command line, with defaults:
+
+       dim        Dimension of the input and output of this component,
+                  e.g. 512
+
+       block-dim  Block size if you want the dropout mask to repeat,
+                  e.g. if dim=512 and you sent block-dim=128, there will
+                  be a mask of dimension 128 repeated 4 times.  This can
+                  be useful in convolutional setups.  If not specified,
+                  block-dim defaults to 'dim'; if specified, it must be
+                  a divisor of 'dim'.
+
+       dropout-proportion=0.5   For conventional dropout, this is the proportion
+                  of mask values that (in expectation) are zero; it would
+                  normally be between 0 and 0.5.  The nonzero mask values
+                  will be given values 1.0 / dropout_proportion, so that the
+                  expected value is 1.0.  This behavior is different from
+                  DropoutComponent and DropoutMaskComponent.
+
+                  For continuous dropout (continuous==true), the dropout scales
+                  will have values (1.0 + 2 * dropout-proportion *
+                  Uniform[-1,1]).  This might seem like a strange choice, but it
+                  means that dropout-proportion=0.5 gives us a kind of
+                  'extremal' case where the dropout scales are distributed as
+                  Uniform[0, 2] and we can pass in the dropout scale as if it
+                  were a conventional dropout scale.
+
+       time-period=0   This determines how the dropout mask interacts
+                  with the time index (t).  In all cases, different sequences
+                  (different 'n' values) get different dropout masks.
+                  If time-period==0, then the dropout mask is shared across
+                  all time values.  If you set time-period > 0, then the
+                  dropout mask is shared across blocks of time values: for
+                  instance if time-period==10, then we'll use one dropout
+                  mask for t values 0 through 9, another for 10 through 19,
+                  and so on.  In all cases, the dropout mask will be shared
+                  across all 'x' values, although in most setups the x values
+                  are just zero so this isn't very interesting.
+                  If you set time-period==1 it would be similar to regular
+                  dropout, and it would probably make more sense to just use the
+                  normal DropoutComponent.
+
+       specaugment-max-proportion=0  If nonzero, causes this component to
+                 implement SpecAugment.  (Note: you probably would want this
+                 after a batch-norm component so the average at input is
+                 zero), and the input dim will be interpreted as some kind of
+                 frequency space, e.g. linear or mel.  specaugment-max-proportion
+                 will be the maximum proportion of the frequency
+                 space that this component might zero out (so multiply this by
+                 by input dim to get the maximum columns that might be zeroed out);
+                 the actual number of columns zeroed out for each sequence will
+                 be randomly chosen between zero and the maximum.  Note: the
+                 non-zeroed frequencies won't be multiplied by a constant more
+                 than one as we would in the normal dropout mode.
+
+       specaugment-max-regions=1  This can be set to a value greater than one
+                 (e.g., 2) to implement a variant of SpecAugment where instead
+                 of zeroing out a single region of the frequency spectrum
+                 we zero out a randomly chosen number of regions, from one to
+                 this number.  The maximum proportion of the frequency spectrum
+                 that we remove is unaffected.
+
+ */
+class GeneralDropoutComponent: public RandomComponent {
+ public:
+  virtual int32 InputDim() const { return dim_; }
+
+  virtual int32 OutputDim() const { return dim_; }
+
+  virtual std::string Info() const;
+
+  virtual void InitFromConfig(ConfigLine *cfl);
+
+  GeneralDropoutComponent();
+
+  GeneralDropoutComponent(const GeneralDropoutComponent &other);
+
+  virtual std::string Type() const { return "GeneralDropoutComponent"; }
+  virtual int32 Properties() const {
+    return kRandomComponent|kPropagateInPlace|kBackpropInPlace|kUsesMemo|
+        (block_dim_ != dim_ ? (kInputContiguous|kOutputContiguous) : 0);
+  }
+
+  virtual void* Propagate(const ComponentPrecomputedIndexes *indexes,
+                          const CuMatrixBase<BaseFloat> &in,
+                          CuMatrixBase<BaseFloat> *out) const;
+  virtual void Backprop(const std::string &debug_info,
+                        const ComponentPrecomputedIndexes *indexes,
+                        const CuMatrixBase<BaseFloat> &, // in_value
+                        const CuMatrixBase<BaseFloat> &, // out_value
+                        const CuMatrixBase<BaseFloat> &out_deriv,
+                        void *memo,
+                        Component *to_update,
+                        CuMatrixBase<BaseFloat> *in_deriv) const;
+
+  virtual void DeleteMemo(void *memo) const {
+    delete static_cast<CuMatrix<BaseFloat>*>(memo);
+  }
+
+  virtual ComponentPrecomputedIndexes* PrecomputeIndexes(
+      const MiscComputationInfo &misc_info,
+      const std::vector<Index> &input_indexes,
+      const std::vector<Index> &output_indexes,
+      bool need_backprop) const;
+
+  virtual void Read(std::istream &is, bool binary);
+  virtual void Write(std::ostream &os, bool binary) const;
+
+  virtual Component* Copy() const;
+
+  void SetDropoutProportion(BaseFloat p) { dropout_proportion_ = p; }
+
+ private:
+
+  // Returns a random matrix reflecting the masking we are applying.
+  // In the normal case where we are doing a
+  // of dimension 'num_mask_rows' by 'block_dim_'.  This
+  // should not be called if test_mode_ is true or dropout_proportion_ is zero.
+  CuMatrix<BaseFloat> *GetMemo(int32 num_mask_rows) const;
+
+
+  // The input and output dimension
+  int32 dim_;
+
+  // block_dim_ must divide dim_.
+  int32 block_dim_;
+
+  // time_period_ can be zero if we want all 't' values to share the same
+  // dropout mask, and a value more than zero if we want blocks of 't' values to
+  // share the dropout mask.  For example, if time_period_ is 10, blocks of size
+  // 10 frames will share the same dropout mask.
+  int32 time_period_;
+
+  BaseFloat dropout_proportion_;
+
+  BaseFloat specaugment_max_proportion_;
+
+  int32 specaugment_max_regions_;
+
+  bool continuous_;
+
+  const GeneralDropoutComponent &operator
+  = (const GeneralDropoutComponent &other); // Disallow.
+};
+
+// This stores some precomputed indexes for GeneralDropoutComponent.
+// This object is created for every instance of the Propagate()
+// function in the compiled computation.
+class GeneralDropoutComponentPrecomputedIndexes:
+      public ComponentPrecomputedIndexes {
+ public:
+
+
+  // num_mask_rows is the number of rows in the dropout-mask matrix, which will
+  // in the normal case equal the number of sequences we are processing.  Its
+  // num-cols is the block_dim_ of the component (e.g. might be the InputDim()
+  // (which is the same as OutputDim()), or maybe less if the block-dim option
+  // was specified.
+  int32 num_mask_rows;
+
+  // 'indexes' is of dimension (the number of rows in the matrix we're doing
+  // Propagate() or Backprop() on) times the (dim_ / block_dim_) of the
+  // GeneralDropoutComponent.  Each value is in the range [0, num_mask_rows-1],
+  // and each value is repeated (dim_ / block_dim_) times.  This array is used
+  // to multiply the reshaped values or derivatives by the appropriate rows of
+  // the dropout matrix.
+  CuArray<int32> indexes;
+
+  virtual ~GeneralDropoutComponentPrecomputedIndexes() { }
+
+  ComponentPrecomputedIndexes *Copy() const {
+    return new GeneralDropoutComponentPrecomputedIndexes(*this);
+  }
+
+  virtual void Write(std::ostream &os, bool binary) const;
+
+  virtual void Read(std::istream &is, bool binary);
+
+  virtual std::string Type() const {
+    return "GeneralDropoutComponentPrecomputedIndexes";
+  }
+};
+
+
+class SpecAugmentTimeMaskComponentPrecomputedIndexes;
+
+/**
+   SpecAugmentTimeMaskComponent implements the time part of SpecAugment.
+   Instead of zeroing out a single time-region of the input, though,
+   it zeroes out multiple smaller time-regions.
+
+   Configuration values accepted on the command line, with defaults:
+
+       dim        Dimension of the input and output of this component,
+                  e.g. 512
+
+
+       zeroed-proportion=0.25  Proportion of the input that is to be zeroed;
+                  should be in the range (0, 1).
+
+       time-mask-max-frames=10   The maximum time duration of the *zeroed*
+                  regions.  The non-zeroed regions in between will have maximum
+                 duration equal to this times (1-z)/z, where z
+                 is zeroed-proportion.
+ */
+class SpecAugmentTimeMaskComponent: public RandomComponent {
+ public:
+  virtual int32 InputDim() const { return dim_; }
+
+  virtual int32 OutputDim() const { return dim_; }
+
+  virtual std::string Info() const;
+
+  virtual void InitFromConfig(ConfigLine *cfl);
+
+  SpecAugmentTimeMaskComponent();
+
+  SpecAugmentTimeMaskComponent(const SpecAugmentTimeMaskComponent &other);
+
+  virtual std::string Type() const { return "SpecAugmentTimeMaskComponent"; }
+  virtual int32 Properties() const {
+    return kRandomComponent|kPropagateInPlace|kBackpropInPlace|kUsesMemo;
+  }
+
+  virtual void* Propagate(const ComponentPrecomputedIndexes *indexes,
+                          const CuMatrixBase<BaseFloat> &in,
+                          CuMatrixBase<BaseFloat> *out) const;
+  virtual void Backprop(const std::string &debug_info,
+                        const ComponentPrecomputedIndexes *indexes,
+                        const CuMatrixBase<BaseFloat> &, // in_value
+                        const CuMatrixBase<BaseFloat> &, // out_value
+                        const CuMatrixBase<BaseFloat> &out_deriv,
+                        void *memo,
+                        Component *to_update,
+                        CuMatrixBase<BaseFloat> *in_deriv) const;
+
+  virtual void DeleteMemo(void *memo) const {
+    delete static_cast<CuVector<BaseFloat>*>(memo);
+  }
+
+  virtual ComponentPrecomputedIndexes* PrecomputeIndexes(
+      const MiscComputationInfo &misc_info,
+      const std::vector<Index> &input_indexes,
+      const std::vector<Index> &output_indexes,
+      bool need_backprop) const;
+
+  virtual void Read(std::istream &is, bool binary);
+  virtual void Write(std::ostream &os, bool binary) const;
+
+  virtual Component* Copy() const;
+
+ private:
+
+  // Returns a random vector reflecting the masking we are applying.
+  CuVector<BaseFloat> *GetMemo(
+      const SpecAugmentTimeMaskComponentPrecomputedIndexes &indexes) const;
+
+
+  // The input and output dimension
+  int32 dim_;
+
+  BaseFloat zeroed_proportion_;
+
+  int32 time_mask_max_frames_;
+
+  const SpecAugmentTimeMaskComponent &operator
+  = (const SpecAugmentTimeMaskComponent &other); // Disallow.
+};
+
+// This stores some precomputed indexes for SpecAugmentTimeMaskComponent.
+// This object is created for every instance of the Propagate()
+// function in the compiled computation.
+class SpecAugmentTimeMaskComponentPrecomputedIndexes:
+      public ComponentPrecomputedIndexes {
+ public:
+
+  // 'indexes' is indexed first by sequence and then by time within that
+  // sequence; each list indexes[s] is a consecutive list of the elements of
+  // that sequence (e.g. t=0, t=1, and so on).  The int32 values inside these
+  // lists are row-indexes into the matrix that is at the input and output of
+  // this component.
+  std::vector<std::vector<int32> > indexes;
+
+  // 'tot_size' is the total number of elements in 'indexes', equal to the
+  // num-rows of the matrix we're doing dropout on.
+  int32 tot_size;
+
+  virtual ~SpecAugmentTimeMaskComponentPrecomputedIndexes() { }
+
+  ComponentPrecomputedIndexes *Copy() const {
+    return new SpecAugmentTimeMaskComponentPrecomputedIndexes(*this);
+  }
+
+  virtual void Write(std::ostream &os, bool binary) const;
+
+  virtual void Read(std::istream &is, bool binary);
+
+  virtual std::string Type() const {
+    return "SpecAugmentTimeMaskComponentPrecomputedIndexes";
+  }
+};
+
 
 
 

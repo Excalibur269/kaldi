@@ -20,10 +20,7 @@
 #ifndef KALDI_CUDAMATRIX_CU_RAND_H_
 #define KALDI_CUDAMATRIX_CU_RAND_H_
 
-#if HAVE_CUDA == 1
-  #include <curand.h>
-#endif
-
+#include "cudamatrix/cu-device.h"
 #include "cudamatrix/cu-matrix.h"
 #include "cudamatrix/cu-vector.h"
 #include "base/kaldi-math.h"
@@ -33,38 +30,21 @@ namespace kaldi {
 template<typename Real>
 class CuRand {
  public:
-  CuRand() {
+
+   void SeedGpu() {
   #if HAVE_CUDA == 1
-    if (CuDevice::Instantiate().Enabled()) {
-      // Initialize the generator,
-      CU_SAFE_CALL(curandCreateGenerator(&gen_, CURAND_RNG_PSEUDO_DEFAULT));
-      // To get same random sequence, call srand() before the constructor is invoked,
-      CU_SAFE_CALL(curandSetGeneratorOrdering(gen_, CURAND_ORDERING_PSEUDO_DEFAULT));
-      CU_SAFE_CALL(curandSetPseudoRandomGeneratorSeed(gen_, RandInt(128, RAND_MAX)));
-      CU_SAFE_CALL(curandSetGeneratorOffset(gen_, 0));
-    }
+		CuDevice::Instantiate().SeedGpu();
   #endif
   }
 
-  ~CuRand() {
-  #if HAVE_CUDA == 1
-    if (CuDevice::Instantiate().Enabled()) {
-      // Release the generator,
-      CU_SAFE_CALL(curandDestroyGenerator(gen_));
-    }
-  #endif
-  }
-
-  /// Generate new seed for the GPU,
-  void SeedGpu() {
-  #if HAVE_CUDA == 1
-    if (CuDevice::Instantiate().Enabled()) {
-      // To get same random sequence, call srand() before the method is invoked,
-      CU_SAFE_CALL(curandSetPseudoRandomGeneratorSeed(gen_, RandInt(128, RAND_MAX)));
-      CU_SAFE_CALL(curandSetGeneratorOffset(gen_, 0));
-    }
-  #endif
-  }
+  // CAUTION.
+  // For the versions of these functions that output to a CuMatrix (as opposed to
+  // CuMatrixBase), the random numbers depend on the stride, and the stride
+  // is not guaranteed to be consistent for the same dimension of matrix
+  // (it usually will be, but not when memory is nearly exhausted).  So
+  // for applications where consistency is essential, either use the versions
+  // of these function that accept CuMatrixBase, or initialize your matrix
+  // with the kStrideEqualNumCols argument to ensure consistent stride.
 
   /// Fill with uniform [0..1] floats,
   void RandUniform(CuMatrixBase<Real> *tgt);
@@ -79,14 +59,8 @@ class CuRand {
   void BinarizeProbs(const CuMatrix<Real> &probs, CuMatrix<Real> *states);
   /// add gaussian noise to each element,
   void AddGaussNoise(CuMatrix<Real> *tgt, Real gscale = 1.0);
-
- private:
-  #if HAVE_CUDA == 1
-  curandGenerator_t gen_;
-  #endif
 };
 
 }  // namsepace
 
 #endif  // KALDI_CUDAMATRIX_CU_RAND_H_
-

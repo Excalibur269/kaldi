@@ -48,7 +48,7 @@ template<class Holder> class SequentialTableReaderImplBase {
   // called on a just-allocated object.
   virtual bool Open(const std::string &rxfilename) = 0;
   // Done() should be called on a successfully opened, not-closed object.
-  // only throws if called a the wrong time (i.e. code error).
+  // only throws if called at the wrong time (i.e. code error).
   virtual bool Done() const = 0;
   // Returns true if the reader is open [i.e. Open() succeeded and
   // the user has not called Close()]
@@ -60,7 +60,7 @@ template<class Holder> class SequentialTableReaderImplBase {
   // Done() returned false.  It throws if the value could not be read.  [However
   // if you use the ,p modifier it will never throw, unless you call it at the
   // wrong time, i.e. unless there is a code error.]
-  virtual const T &Value() = 0;
+  virtual T &Value() = 0;
   virtual void FreeCurrent() = 0;
   // move to the next object.  This won't throw unless called wrongly (e.g. on
   // non-open archive.]
@@ -159,7 +159,7 @@ template<class Holder>  class SequentialTableReaderScriptImpl:
     return key_;
   }
 
-  const T &Value() {
+  T &Value() {
     if (!EnsureObjectLoaded())
       KALDI_ERR << "Failed to load object from "
                 << PrintableRxfilename(data_rxfilename_)
@@ -612,7 +612,7 @@ template<class Holder>  class SequentialTableReaderArchiveImpl:
     return key_;
   }
 
-  const T &Value() {
+  T &Value() {
     switch (state_) {
       case kHaveObject:
         break;  // only valid case.
@@ -776,7 +776,7 @@ class SequentialTableReaderBackgroundImpl:
       KALDI_ERR << "Calling Key() at the wrong time.";
     return key_;
   }
-  virtual const T &Value() {
+  virtual T &Value() {
     if (key_.empty())
       KALDI_ERR << "Calling Value() at the wrong time.";
     return holder_.Value();
@@ -930,7 +930,7 @@ void SequentialTableReader<Holder>::FreeCurrent() {
 
 
 template<class Holder>
-const typename SequentialTableReader<Holder>::T &
+typename SequentialTableReader<Holder>::T &
 SequentialTableReader<Holder>::Value() {
   CheckImpl();
   return impl_->Value();  // This may throw (if EnsureObjectLoaded() returned false you
@@ -1152,7 +1152,7 @@ class TableWriterScriptImpl: public TableWriterImplBase<Holder> {
                                            &script_rxfilename_,
                                            &opts_);
     KALDI_ASSERT(ws == kScriptWspecifier);  // or wrongly called.
-    KALDI_ASSERT(script_.empty());  // no way it could be nonempty at this poin.
+    KALDI_ASSERT(script_.empty());  // no way it could be nonempty at this point.
 
     if (!ReadScriptFile(script_rxfilename_,
                          true,  // print any warnings

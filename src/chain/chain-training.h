@@ -45,6 +45,14 @@ struct ChainTrainingOptions {
   // (squared so it's additive across the dimensions).  e.g. try 0.0005.
   BaseFloat l2_regularize;
 
+
+  // This is similar to an l2 regularization constant (like l2-regularize) but
+  // applied on the part of the nnet output matrix that exceeds the range
+  // [-30,30]... this is necessary to avoid things regularly going out of the
+  // range that we can do exp() on, since the denominator computation is not in
+  // log space and to avoid NaNs we limit the outputs to the range [-30,30].
+  BaseFloat out_of_range_regularize;
+
   // Coefficient for 'leaky hmm'.  This means we have an epsilon-transition from
   // each state to a special state with probability one, and then another
   // epsilon-transition from that special state to each state, with probability
@@ -53,6 +61,7 @@ struct ChainTrainingOptions {
   // B, with transition from A to B, so we don't have to consider epsilon loops-
   // or just imagine the coefficient is small enough that we can ignore the
   // epsilon loops.
+  // Note: we generally set leaky_hmm_coefficient to 0.1.
   BaseFloat leaky_hmm_coefficient;
 
 
@@ -61,13 +70,19 @@ struct ChainTrainingOptions {
   // should have a softmax as its final nonlinearity.
   BaseFloat xent_regularize;
 
-  ChainTrainingOptions(): l2_regularize(0.0), leaky_hmm_coefficient(1.0e-05),
+  ChainTrainingOptions(): l2_regularize(0.0), out_of_range_regularize(0.01),
+                          leaky_hmm_coefficient(1.0e-05),
                           xent_regularize(0.0) { }
-  
+
   void Register(OptionsItf *opts) {
     opts->Register("l2-regularize", &l2_regularize, "l2 regularization "
                    "constant for 'chain' training, applied to the output "
                    "of the neural net.");
+    opts->Register("out-of-range-regularize", &out_of_range_regularize,
+                   "Constant that controls how much we penalize the nnet output "
+                   "being outside the range [-30,30].  This is needed because we "
+                   "limit it to that range in the denominator computation (which "
+                   "is to avoid NaNs because it is not done in log space.");
     opts->Register("leaky-hmm-coefficient", &leaky_hmm_coefficient, "Coefficient "
                    "that allows transitions from each HMM state to each other "
                    "HMM state, to ensure gradual forgetting of context (can "
@@ -107,10 +122,13 @@ struct ChainTrainingOptions {
                            You don't have to zero this before passing to this function,
                            we zero it internally.
    @param [out] xent_output_deriv  If non-NULL, then the numerator part of the derivative
-                           (which equals a posterior from the numerator forward-backward,
-                           scaled by the supervision weight) is written to here.  This will
-                           be used in the cross-entropy regularization code.  This value
-                           is also used in computing the cross-entropy objective value.
+                           (which equals a posterior from the numerator
+                           forward-backward, scaled by the supervision weight)
+                           is written to here (this function will set it to the
+                           correct size first; doing it this way reduces the
+                           peak memory use).  xent_output_deriv will be used in
+                           the cross-entropy regularization code; it is also
+                           used in computing the cross-entropy objective value.
 */
 void ComputeChainObjfAndDeriv(const ChainTrainingOptions &opts,
                               const DenominatorGraph &den_graph,
@@ -120,12 +138,11 @@ void ComputeChainObjfAndDeriv(const ChainTrainingOptions &opts,
                               BaseFloat *l2_term,
                               BaseFloat *weight,
                               CuMatrixBase<BaseFloat> *nnet_output_deriv,
-                              CuMatrixBase<BaseFloat> *xent_output_deriv = NULL);
-                              
+                              CuMatrix<BaseFloat> *xent_output_deriv = NULL);
+
 
 
 }  // namespace chain
 }  // namespace kaldi
 
 #endif  // KALDI_CHAIN_CHAIN_TRAINING_H_
-

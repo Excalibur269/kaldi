@@ -99,7 +99,7 @@ remove_egs=true
 # End configuration section.
 echo "$0 $@"  # Print the command line for logging
 
-. cmd.sh
+. ./cmd.sh
 . ./path.sh
 . ./utils/parse_options.sh
 
@@ -187,7 +187,7 @@ if [ $stage -le 17 ]; then
   echo "$0: creating neural net configs using the xconfig parser";
 
   num_targets=$(tree-info $tree_dir/tree |grep num-pdfs|awk '{print $2}')
-  learning_rate_factor=$(echo "print 0.5/$xent_regularize" | python)
+  learning_rate_factor=$(echo "print (0.5/$xent_regularize)" | python)
 
   tdnn_opts='ng-affine-options="update-period=1"'
   lstmp_opts='ng-affine-options="update-period=1" decay-time=20'
@@ -243,7 +243,7 @@ if [ $stage -le 18 ]; then
     --cmd "$decode_cmd" \
     --feat.online-ivector-dir $train_ivector_dir \
     --feat.cmvn-opts "--norm-means=false --norm-vars=false" \
-    --chain.xent-regularize 0.1 \
+    --chain.xent-regularize $xent_regularize \
     --chain.leaky-hmm-coefficient 0.1 \
     --chain.l2-regularize 0.00005 \
     --chain.apply-deriv-weights false \

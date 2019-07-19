@@ -118,7 +118,7 @@ void CuPackedMatrix<Real>::Swap(PackedMatrix<Real> *mat) {
         this->Swap(&temp); // now temp is full, *this is empty.
         mat->Swap(&temp); // now mat has data from *this, temp has
         // data from mat.
-        this->Swap(mat); // copy data in mat to *this, which is now empty.
+        this->Swap(&temp); // copy data in mat to *this, which is now empty.
       } else { // *this is full but *mat is empty.
         mat->Resize(this->num_rows_, kUndefined);
         this->CopyToPacked(mat);
@@ -143,8 +143,9 @@ void CuPackedMatrix<Real>::CopyFromPacked(const CuPackedMatrix<Real> &src) {
     size_t nr = static_cast<size_t>(num_rows_),
         num_bytes = ((nr * (nr+1)) / 2) * sizeof(Real);
 
-    CU_SAFE_CALL(cudaMemcpy(data_, src.data_, num_bytes,
-                            cudaMemcpyDeviceToDevice));
+    CU_SAFE_CALL(
+      cudaMemcpyAsync(data_, src.data_, num_bytes, cudaMemcpyDeviceToDevice,
+                      cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuPackedMatrix::CopyFromPacked1",
                                         tim);
   } else
@@ -161,8 +162,9 @@ void CuPackedMatrix<Real>::CopyFromPacked(const PackedMatrix<Real> &src) {
   if (CuDevice::Instantiate().Enabled()) {
     if (num_rows_ == 0) return; // Nothing to do.
     CuTimer tim;
-    CU_SAFE_CALL(cudaMemcpy(data_, src.data_, src.SizeInBytes(),
-                            cudaMemcpyHostToDevice));
+    CU_SAFE_CALL(cudaMemcpyAsync(data_, src.data_, src.SizeInBytes(),
+                                 cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuPackedMatrix::CopyFromPacked2", tim);
   } else
 #endif
@@ -183,8 +185,9 @@ void CuPackedMatrix<Real>::CopyToPacked(PackedMatrix<Real> *dst) const {
     size_t nr = static_cast<size_t>(num_rows_),
       num_bytes = ((nr * (nr+1)) / 2) * sizeof(Real);
 
-    CU_SAFE_CALL(cudaMemcpy(dst->data_, data_, num_bytes,
-                            cudaMemcpyDeviceToHost));
+    CU_SAFE_CALL(cudaMemcpyAsync(dst->data_, data_, num_bytes,
+                                 cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuPackedMatrix::CopyToPackedD2H", tim);
   } else
 #endif
@@ -247,7 +250,8 @@ void CuPackedMatrix<Real>::SetZero() {
     size_t nr = static_cast<size_t>(num_rows_),
       num_bytes = ((nr * (nr+1)) / 2) * sizeof(Real);
 
-    CU_SAFE_CALL(cudaMemset(reinterpret_cast<void*>(this->data_), 0, num_bytes));
+    CU_SAFE_CALL(cudaMemsetAsync(reinterpret_cast<void*>(this->data_), 0, 
+          num_bytes, cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuPackedMatrix::SetZero", tim);
   } else
   #endif
@@ -298,7 +302,7 @@ void CuPackedMatrix<Real>::Scale(Real alpha) {
     CuTimer tim;
     size_t nr = static_cast<size_t>(num_rows_),
         num_elements = ((nr * (nr+1)) / 2);
-    CU_SAFE_CALL(cublas_scal(GetCublasHandle(), num_elements, alpha, data_, 1));
+    CUBLAS_SAFE_CALL(cublas_scal(GetCublasHandle(), num_elements, alpha, data_, 1));
 
     CuDevice::Instantiate().AccuProfile("CuPackedMatrix::Scale", tim);
   } else

@@ -5,7 +5,6 @@ set -e
 # based on run_tdnn_7b.sh in the swbd recipe
 
 # configs for 'chain'
-affix=
 stage=7 # assuming you already ran the xent systems
 train_stage=-10
 get_egs_stage=-10
@@ -37,7 +36,6 @@ where "nvcc" is installed.
 EOF
 fi
 
-dir=${dir}${affix:+_$affix}
 ali_dir=exp/tri5a_rvb_ali
 treedir=exp/chain/tri6_tree_11000
 lang=data/lang_chain
@@ -138,7 +136,7 @@ if [ $stage -le 11 ]; then
   echo "$0: creating neural net configs using the xconfig parser";
 
   num_targets=$(tree-info $treedir/tree |grep num-pdfs|awk '{print $2}')
-  learning_rate_factor=$(echo "print 0.5/$xent_regularize" | python)
+  learning_rate_factor=$(echo "print (0.5/$xent_regularize)" | python)
 
   mkdir -p $dir/configs
   cat <<EOF > $dir/configs/network.xconfig
@@ -184,6 +182,7 @@ if [ $stage -le 12 ]; then
      /export/b0{5,6,7,8}/$USER/kaldi-data/egs/aspire-$(date +'%m_%d_%H_%M')/s5c/$dir/egs/storage $dir/egs/storage
   fi
 
+  mkdir -p $dir/egs
   touch $dir/egs/.nodelete # keep egs around when that run dies.
 
   steps/nnet3/chain/train.py --stage $train_stage \
@@ -223,7 +222,7 @@ fi
 
 if [ $stage -le 14 ]; then
 #%WER 27.8 | 2120 27217 | 78.2 13.6 8.2 6.0 27.8 75.9 | -0.613 | exp/chain/tdnn_7b/decode_dev_aspire_whole_uniformsegmented_win10_over5_v6_200jobs_iterfinal_pp_fg/score_9/penalty_0.0/ctm.filt.filt.sys
-  local/nnet3/prep_test_aspire.sh --stage 1 --decode-num-jobs 30 --affix "v7" \
+  local/nnet3/decode.sh --stage 1 --decode-num-jobs 30 --affix "v7" \
    --acwt 1.0 --post-decode-acwt 10.0 \
    --window 10 --overlap 5 \
    --sub-speaker-frames 6000 --max-count 75 --ivector-scale 0.75 \
@@ -235,7 +234,7 @@ fi
 #  #Online decoding example
 # %WER 31.5 | 2120 27224 | 74.0 13.0 13.0 5.5 31.5 77.1 | -0.558 | exp/chain/tdnn_7b_online/decode_dev_aspire_whole_uniformsegmented_win10_over5_v9_online_iterfinal_pp_fg/score_10/penalty_0.0/ctm.filt.filt.sys
 
-#  local/nnet3/prep_test_aspire_online.sh --stage 2 --decode-num-jobs 30 --affix "v7" \
+#  local/nnet3/decode_online.sh --stage 2 --decode-num-jobs 30 --affix "v7" \
 #   --acwt 1.0 --post-decode-acwt 10.0 \
 #   --window 10 --overlap 5 \
 #   --max-count 75 \

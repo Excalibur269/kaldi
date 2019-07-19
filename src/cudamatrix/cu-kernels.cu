@@ -6,7 +6,9 @@
 //                2013  Hainan Xu
 //                2013  Xiaohui Zhang
 //           2013-2015  Guoguo Chen
-//                2016  Shiyin Kang
+//           2016-2018  Shiyin Kang
+//                2017  Hossein Hadian, Daniel Galvez
+//                2019  Yiwen Shao
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +29,7 @@
 #include <limits>
 #include <math_constants.h>
 #include "cudamatrix/cu-kernels-ansi.h"
-
+#include <cub/block/block_reduce.cuh>
 
 
 /***********************************************************************
@@ -195,69 +197,177 @@ static void _copy_from_mat_trans(Real* mat_out, const OtherReal* mat_in,
   }
 }
 
+// Copy from CSR sparse matrix to dense matrix
+//
+// We use warpSize threads per row to access only the nnz elements.
+// Every CU1DBLOCK/warpSize rows share one thread block.
+// 1D grid to cover all rows.
 template<typename Real, typename OtherReal>
 __global__
-static void _copy_from_smat(Real* mat_out,
-                            const MatrixElement<OtherReal>* smat_in,
-                            MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  int smat_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (smat_index >= d_in)
-    return;
-  int data_index = smat_in[smat_index].row * d_out.stride
-      + smat_in[smat_index].column;
-  mat_out[data_index] = smat_in[smat_index].weight;
+static void _copy_from_smat(Real* mat, MatrixDim mat_dim,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const OtherReal* smat_val) {
+  const int i = blockIdx.x * blockDim.y + threadIdx.y; // row idx
+  if (i < mat_dim.rows) {
+    const int nz_start = smat_row_ptr[i];
+    const int nz_end = smat_row_ptr[i + 1];
+    for (int nz_id = nz_start + threadIdx.x; nz_id < nz_end; nz_id +=
+        warpSize) {
+      const int j = smat_col_idx[nz_id]; // col idx
+      mat[i * mat_dim.stride + j] = static_cast<Real>(smat_val[nz_id]);
+    }
+  }
 }
 
+
+/// Select a subset of the rows of a CSR SparseMatrix.
+/// Sets 'out' to only the rows of 'in' that are listed
+/// in 'row_indexes'.  'row_indexes' must be sorted and unique,
+/// and satisfy 0 <= row_indexes[i] < in.size().
+///
+/// Note: 'out_row_ptr' is an input parameter that is calculated before
+/// calling this kernel function
+///
+/// We use warpSize threads per row to access only the nnz elements.
+/// Every CU1DBLOCK/warpSize rows share one thread block.
+/// 1D grid to cover all selected rows.
+template<typename Real>
+__global__
+static void _select_rows(const int* out_row_ptr, int* out_col_idx,
+                         Real* out_val, const int* row_indexes,
+                         const int num_selected_rows, const int* in_row_ptr,
+                         const int* in_col_idx, const Real* in_val) {
+  const int out_i = blockIdx.x * blockDim.y + threadIdx.y; // out row idx
+  if (out_i < num_selected_rows) {
+    const int in_i = row_indexes[out_i];
+    const int in_row_start = in_row_ptr[in_i];
+    const int out_row_start = out_row_ptr[out_i];
+    const int row_length = in_row_ptr[in_i + 1] - in_row_start;
+    for (int k = threadIdx.x; k < row_length; k += warpSize) {
+      const int in_n = in_row_start + k;
+      const int out_n = out_row_start + k;
+      out_col_idx[out_n] = in_col_idx[in_n];
+      out_val[out_n] = in_val[in_n];
+    }
+  }
+}
+
+// mat += alpha * smat
+//
+// We use warpSize threads per row to access only the nonzero elements.
+// Every CU1DBLOCK/warpSize rows share one thread block.
+// 1D grid to cover all rows of smat.
+template<typename Real>
+__global__
+static void _add_smat(Real* mat, MatrixDim mat_dim, Real alpha,
+                      const int* smat_row_ptr, const int* smat_col_idx,
+                      const Real* smat_val) {
+  const int i = blockIdx.x * blockDim.y + threadIdx.y; // row idx
+  if (i < mat_dim.rows) {
+    const int row_start = smat_row_ptr[i];
+    const int row_end = smat_row_ptr[i + 1];
+    for (int n = row_start + threadIdx.x; n < row_end; n += warpSize) {
+      const int j = smat_col_idx[n]; // col idx of smat
+      mat[i * mat_dim.stride + j] += alpha * smat_val[n];
+    }
+  }
+}
+
+// mat += alpha * smat^T
+//
+// We use warpSize threads per row to access only the nonzero elements.
+// Every CU1DBLOCK/warpSize rows share one thread block.
+// 1D grid to cover all rows of smat.
+template<typename Real>
+__global__
+static void _add_smat_trans(Real* mat, MatrixDim mat_dim, Real alpha,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const Real* smat_val) {
+  const int i = blockIdx.x * blockDim.y + threadIdx.y; // row idx
+  if (i < mat_dim.cols) {
+    const int row_start = smat_row_ptr[i];
+    const int row_end = smat_row_ptr[i + 1];
+    for (int n = row_start + threadIdx.x; n < row_end; n += warpSize) {
+      const int j = smat_col_idx[n]; // col idx of smat
+      mat[j * mat_dim.stride + i] += alpha * smat_val[n];
+    }
+  }
+}
+
+/// Fill the array 'data' with the sequence [base ... base + length)
+/// Use 1D block and 1D grid
+template<typename T>
+__global__
+static void _sequence(T* data, int length, T base) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < length) {
+    data[i] = base + T(i);
+  }
+}
+
+// Copy from CSR sparse matrix to transposed dense matrix
+//
+// We use warpSize threads per row to access only the nnz elements.
+// Every CU1DBLOCK/warpSize rows share one thread block.
+// 1D grid to cover all rows.
 template<typename Real, typename OtherReal>
 __global__
-static void _copy_from_smat_trans(Real* mat_out,
-                                  const MatrixElement<OtherReal>* smat_in,
-                                  MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  int smat_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (smat_index >= d_in)
-    return;
-  int data_index = smat_in[smat_index].column * d_out.stride
-      + smat_in[smat_index].row;
-  mat_out[data_index] = smat_in[smat_index].weight;
+static void _copy_from_smat_trans(Real* mat, MatrixDim mat_dim,
+                                  const int* smat_row_ptr,
+                                  const int* smat_col_idx,
+                                  const OtherReal* smat_val) {
+  const int i = blockIdx.x * blockDim.y + threadIdx.y; // row idx of smat
+  if (i < mat_dim.cols) {
+    const int nz_start = smat_row_ptr[i];
+    const int nz_end = smat_row_ptr[i + 1];
+    for (int nz_id = nz_start + threadIdx.x; nz_id < nz_end; nz_id +=
+        warpSize) {
+      const int j = smat_col_idx[nz_id]; // col idx of smat
+      mat[j * mat_dim.stride + i] = static_cast<Real>(smat_val[nz_id]);
+    }
+  }
 }
 
+// First stage of trace(mat * smat^T)
+// We use warpSize threads per row to access only the nnz elements.
+// Every CU1DBLOCK/warpSize rows share one thread block.
+// 1D grid to cover all rows of smat.
 template<typename Real>
 __global__
-static void _trace_mat_smat_trans(const Real* mat_in,
-                                  const MatrixElement<Real>* smat_in,
-                                  MatrixDim mat_d_in,
-                                  MatrixIndexT_cuda smat_d_in,
-                                  Real* trace_vec_out) {
-  int smat_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (smat_index >= smat_d_in)
-    return;
-  int mat_index = smat_in[smat_index].row * mat_d_in.stride
-      + smat_in[smat_index].column;
-  trace_vec_out[smat_index] = mat_in[mat_index] * smat_in[smat_index].weight;
+static void _trace_mat_smat_trans(const Real* mat, MatrixDim mat_dim,
+                                  const int* smat_row_ptr,
+                                  const int* smat_col_idx, const Real* smat_val,
+                                  Real* trace_vec) {
+  const int i = blockIdx.x * blockDim.y + threadIdx.y; // row idx of smat
+  if (i < mat_dim.rows) {
+    const int nz_start = smat_row_ptr[i];
+    const int nz_end = smat_row_ptr[i + 1];
+    for (int nz_id = nz_start + threadIdx.x; nz_id < nz_end; nz_id +=
+        warpSize) {
+      const int j = smat_col_idx[nz_id]; // col idx of smat
+      trace_vec[nz_id] = mat[i * mat_dim.stride + j] * smat_val[nz_id];
+    }
+  }
 }
 
+// First stage of trace(mat * smat)
+// We use warpSize threads per row to access only the nnz elements.
+// Every CU1DBLOCK/warpSize rows share one thread block.
+// 1D grid to cover all rows of smat.
 template<typename Real>
 __global__
-static void _trace_mat_smat(const Real* mat_in,
-                            const MatrixElement<Real>* smat_in,
-                            MatrixDim mat_d_in, MatrixIndexT_cuda smat_d_in,
-                            Real* trace_vec_out) {
-  int smat_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (smat_index >= smat_d_in)
-    return;
-  int mat_index = smat_in[smat_index].column * mat_d_in.stride
-      + smat_in[smat_index].row;
-  trace_vec_out[smat_index] = mat_in[mat_index] * smat_in[smat_index].weight;
-}
-
-template<typename Real>
-__global__
-static void _apply_exp(Real* mat, MatrixDim d) {
-  int32_cuda i = blockIdx.x * blockDim.x + threadIdx.x;
-  int32_cuda j = blockIdx.y * blockDim.y + threadIdx.y;
-  int32_cuda index = i + j * d.stride;
-  if (i < d.cols && j < d.rows) {
-    mat[index] = exp(mat[index]);
+static void _trace_mat_smat(const Real* mat, MatrixDim mat_dim,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const Real* smat_val, Real* trace_vec) {
+  const int i = blockIdx.x * blockDim.y + threadIdx.y; // row idx of smat
+  if (i < mat_dim.cols) {
+    const int nz_start = smat_row_ptr[i];
+    const int nz_end = smat_row_ptr[i + 1];
+    for (int nz_id = nz_start + threadIdx.x; nz_id < nz_end; nz_id +=
+        warpSize) {
+      const int j = smat_col_idx[nz_id]; // col idx of smat
+      trace_vec[nz_id] = mat[j * mat_dim.stride + i] * smat_val[nz_id];
+    }
   }
 }
 
@@ -339,16 +449,6 @@ static void _scale(Real* mat, Real value, MatrixDim d) {
   int32_cuda index = i + j * d.stride;
   if (i < d.cols && j < d.rows)
     mat[index] = mat[index] * value;
-}
-
-template<typename Real>
-__global__
-static void _apply_log(Real* mat, MatrixDim d) {
-  int32_cuda i = blockIdx.x * blockDim.x + threadIdx.x;
-  int32_cuda j = blockIdx.y * blockDim.y + threadIdx.y;
-  int32_cuda index = i + j * d.stride;
-  if (i < d.cols && j < d.rows)
-    mat[index] = log(mat[index]);
 }
 
 template<typename Real>
@@ -799,6 +899,7 @@ static void _trace_mat_mat(const Real* A, const Real* B, MatrixDim dA,
     Real trans[TileDim][TileDim + 1];
     Real sum[CU1DBLOCK];
   } smem;
+
   // linear thread id;
   const int32_cuda tid = threadIdx.y * blockDim.x + threadIdx.x;
   const int32_cuda grid_height = gridDim.y * TileDim;
@@ -862,6 +963,7 @@ static void _trace_mat_mat(const Real* A, const Real* B, MatrixDim dA,
   if (tid == 0) {
     value[blockIdx.y * gridDim.x + blockIdx.x] = smem.sum[0];
   }
+
 }
 
 // _trace_mat_mat_trans reduce the partial sum to
@@ -871,6 +973,7 @@ __global__
 static void _trace_mat_mat_trans(const Real* A, const Real* B, MatrixDim dA,
                                  int B_stride, Real* value) {
   __shared__ Real ssum[CU1DBLOCK];
+
   // linear thread id;
   const int32_cuda tid = threadIdx.y * blockDim.x + threadIdx.x;
   const int32_cuda j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -887,7 +990,7 @@ static void _trace_mat_mat_trans(const Real* A, const Real* B, MatrixDim dA,
   }
   ssum[tid] = tsum;
   __syncthreads();
-
+  
   // Block reduce
 # pragma unroll
   for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
@@ -959,7 +1062,7 @@ __global__
 static void _add_diag_mat_mat_MTN(const Real alpha, const Real* M,
                                   const int stride_M, const Real* N,
                                   const MatrixDim dim_N, const Real beta,
-                                  Real* v) {
+                                  Real* v, const int stride_v) {
   __shared__ Real ssum[CU1DBLOCK];
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -968,9 +1071,12 @@ static void _add_diag_mat_mat_MTN(const Real alpha, const Real* M,
     return;
 
   // Loop along the matrix column.
-  // Reduce to CU1DBLOCK / TileDim elements per column.
+  // Reduce to gridDim.y * CU1DBLOCK / TileDim elements per column.
   Real tsum = Real(0);
-  for (int i = threadIdx.y; i < dim_N.rows; i += blockDim.y) {
+
+  const int grid_stride_y = blockDim.y * gridDim.y;
+  for (int i = blockIdx.y * blockDim.y + threadIdx.y; i < dim_N.rows; i +=
+      grid_stride_y) {
     tsum += M[i * stride_M + j] * N[i * dim_N.stride + j];
   }
   ssum[tid] = tsum;
@@ -997,7 +1103,12 @@ static void _add_diag_mat_mat_MTN(const Real alpha, const Real* M,
 
   // output TileDim sums per thread block
   if (tid < TileDim) {
-    v[j] = alpha * ssum[tid] + beta * v[j];
+    if (beta != Real(0)) {
+      v[blockIdx.y * stride_v + j] = alpha * ssum[tid]
+          + beta * v[blockIdx.y * stride_v + j];
+    } else {
+      v[blockIdx.y * stride_v + j] = alpha * ssum[tid];
+    }
   }
 }
 
@@ -1187,6 +1298,24 @@ static void _cuda_comp_obj_deriv(MatrixElement<Real> *x, int s, const Real* z,
 
 template<typename Real>
 __global__
+static void _cuda_vector_copy_elements(Real *data, int dim,
+                                       const Real *src_mat, int mat_stride,
+                                       bool transpose,
+                                       const MatrixIndexT_cuda* elements) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= dim)
+    return;
+  int j = elements[i];
+  int mat_index;
+  if (transpose)
+    mat_index = i + j * mat_stride;
+  else
+    mat_index = j + i * mat_stride;
+  data[i] = src_mat[mat_index];
+}
+
+template<typename Real>
+__global__
 static void _cuda_matrix_add_elements(Real *data, MatrixDim dim, Real alpha,
                                       MatrixElement<Real>* x,
                                       int num_elements) {
@@ -1206,6 +1335,21 @@ static void _cuda_matrix_add_indexed_values(MatrixDim dim, Real alpha,
     return;
   int data_i = indices[i].first * dim.stride + indices[i].second;
   data[data_i] += alpha * x[i];
+}
+
+template<typename Real>
+__global__
+static void _cuda_matrix_add_to_elements(Real alpha,
+                                         Real* mat, MatrixDim dim,
+                                         const MatrixIndexT_cuda* elements) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < dim.rows) {
+    int col = elements[row];
+    if (col >= 0) {
+      int index = col + row * dim.stride;
+      mat[index] += alpha;
+    }
+  }
 }
 
 template<typename Real>
@@ -1497,6 +1641,48 @@ static void _vec_transform_reduce(
     result[blockIdx.x] = op.PostReduce(sdata[0], result[blockIdx.x]);
 }
 
+// Reduce a matrix 'mat' to a row vector 'result'
+template<EnumTransformReduce TransReduceType, typename Real>
+__global__
+static void _transform_reduce_mat_rows(
+    Real *result, const Real *mat, const MatrixDim d,
+    const TransReduceOp<TransReduceType, Real> op) {
+
+  __shared__ Real sdata[CU1DBLOCK];
+  const int tid = threadIdx.x;
+  const int j = blockIdx.x;
+
+  Real tdata = op.InitValue();
+  for (int i = tid; i < d.rows; i += CU1DBLOCK) {
+    //Note the loads of mat are uncoalesced.  We could eliminate these
+    //with shared memory but at the matrix sizes we are currently looking 
+    //at it probably would not help much and would add a lot of complexity.
+    //Alternatively we could look at something like trov to help loads.
+    tdata = op.Reduce(tdata, op.Transform(mat[i * d.stride + j]));
+  }
+  sdata[tid] = tdata;
+  __syncthreads();
+
+  // Tree reduce
+# pragma unroll
+  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
+    if (tid < shift)
+      sdata[tid] = op.Reduce(sdata[tid], sdata[tid + shift]);
+    __syncthreads();
+  }
+
+  // Reduce last warp. Threads implicitly synchronized within a warp.
+  if (tid < warpSize) {
+    for (int shift = warpSize; shift > 0; shift >>= 1)
+      sdata[tid] = op.Reduce(sdata[tid], sdata[tid + shift]);
+  }
+
+  // Output to vector result.
+  if (tid == 0) {
+    result[j] = op.PostReduce(sdata[0], result[j]);
+  }
+}
+
 // Reduce a matrix 'mat' to a column vector 'result'
 template<EnumTransformReduce TransReduceType, typename Real>
 __global__
@@ -1636,84 +1822,6 @@ static void _vec_apply_ceiling(Real *v, Real ceiling_val, float *count,
 
 template<typename Real>
 __global__
-static void _apply_pow(Real* mat, Real power, MatrixDim d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
-  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
-  int index = i + j * d.stride;
-  if (i < d.cols && j < d.rows) {
-    if (power == 1.0)
-      return;
-    if (power == 2.0) {
-      mat[index] = mat[index] * mat[index];
-    } else if (power == 0.5) {
-      if (!(mat[index] >= 0.0))
-        return;
-      mat[index] = sqrt(mat[index]);
-    } else {
-      mat[index] = pow(mat[index], power);
-    }
-  }
-}
-
-template<typename Real>
-__global__
-static void _apply_pow_abs(Real* mat, Real power, bool include_sign,
-                           MatrixDim d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
-  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
-  int index = i + j * d.stride;
-  if (i < d.cols && j < d.rows) {
-    if (include_sign == true && mat[index] < 0) {
-      if (power == 1.0)
-        mat[index] = -std::abs(mat[index]);
-      if (power == 2.0) {
-        mat[index] = -mat[index] * mat[index];
-      } else if (power == 0.5) {
-        mat[index] = -sqrt(std::abs(mat[index]));
-      } else {
-        mat[index] = -pow(std::abs(mat[index]), power);
-      }
-    } else {
-      if (power == 1.0)
-        mat[index] = std::abs(mat[index]);
-      if (power == 2.0) {
-        mat[index] = mat[index] * mat[index];
-      } else if (power == 0.5) {
-        mat[index] = sqrt(std::abs(mat[index]));
-      } else if (power < 0.0 && mat[index] == 0.0) {
-        mat[index] = 0.0;
-      } else {
-        mat[index] = pow(std::abs(mat[index]), power);
-      }
-    }
-  }
-}
-
-template<typename Real>
-__global__
-static void _apply_heaviside(Real* mat, MatrixDim d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
-  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
-  int index = i + j * d.stride;
-  if (i < d.cols && j < d.rows)
-    mat[index] = (mat[index] > 0.0 ? 1.0 : 0.0);
-}
-
-template<typename Real>
-__global__
-static void _apply_floor(Real* mat, Real floor_val, MatrixDim d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
-  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
-  int index = i + j * d.stride;
-
-  if (i < d.cols && j < d.rows) {
-    if (mat[index] < floor_val)
-      mat[index] = floor_val;
-  }
-}
-
-template<typename Real>
-__global__
 static void _copy_cols(Real* dst, const Real *src,
                        const MatrixIndexT_cuda* reorder, MatrixDim dst_dim,
                        int src_stride) {
@@ -1815,6 +1923,23 @@ static void _add_rows(Real alpha, Real* dst, const Real *src,
 
 template<typename Real>
 __global__
+static void _mul_rows(Real* dst, const Real *src,
+                      const MatrixIndexT_cuda* reorder, MatrixDim dst_dim,
+                      int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
+  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
+  if (i < dst_dim.cols && j < dst_dim.rows) {
+    int dst_index = j * dst_dim.stride + i;
+    if (reorder[j] >= 0) {
+      int src_index = reorder[j] * src_stride + i;
+      dst[dst_index] *= src[src_index];
+    }
+  }
+}
+
+
+template<typename Real>
+__global__
 static void _add_rows(Real alpha, Real* dst, const Real * const *src,
                       MatrixDim dst_dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
@@ -1829,6 +1954,22 @@ static void _add_rows(Real alpha, Real* dst, const Real * const *src,
 
 template<typename Real>
 __global__
+static void _add_to_rows(Real alpha, Real* dst, const Real *src,
+                         const MatrixIndexT_cuda* reorder, MatrixDim src_dim,
+                         int dst_stride) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;  // col index
+  int r = blockIdx.y * blockDim.y + threadIdx.y;  // row index
+  if (c < src_dim.cols && r < src_dim.rows) {
+    int src_index = r * src_dim.stride + c;
+    if (reorder[r] >= 0) {
+      int dst_index = reorder[r] * dst_stride + c;
+      dst[dst_index] += alpha * src[src_index];
+    }
+  }
+}
+
+template<typename Real>
+__global__
 static void _add_to_rows(Real alpha, Real* const * dst, const Real *src,
                          MatrixDim src_dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
@@ -1837,19 +1978,6 @@ static void _add_to_rows(Real alpha, Real* const * dst, const Real *src,
     if (dst[j] != NULL) {
       dst[j][i] += alpha * src[j * src_dim.stride + i];
     }
-  }
-}
-
-template<typename Real>
-__global__
-static void _apply_ceiling(Real* mat, Real ceiling_val, MatrixDim d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int j = blockIdx.y * blockDim.y + threadIdx.y;
-  int index = i + j * d.stride;
-
-  if (i < d.cols && j < d.rows) {
-    if (mat[index] > ceiling_val)
-      mat[index] = ceiling_val;
   }
 }
 
@@ -2174,6 +2302,42 @@ static void _diff_tanh(Real*eout, const Real*e, const Real*y, MatrixDim d,
     eout[dst_index] = (1.0 - y[y_index] * y[y_index]) * e[e_index];
 }
 
+
+
+/*
+  This function copies x to y while bounding the elements
+  away from zero using the scalar function:
+     y =  x if x <= -epsilon or x >= +epsilon
+          +epsilon if 0 <= x < epsilon
+          -epsilon if -epsilon < x < 0.
+  where:
+     x is the source matrix, of dimension and stride given by d
+     epsilon > 0
+     y is the destination matrix, with the num-rows and num-cols
+     given by d, but stride given by y_stride.
+ */
+template<typename Real>
+__global__
+static void _ensure_nonzero(const Real *x, MatrixDim d, Real epsilon,
+                            int y_stride, Real *y) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int x_index = i + j * d.stride,
+      y_index = i + j * y_stride;
+  if (i < d.cols && j < d.rows) {
+    Real src = x[x_index], dst;
+    if (src <= -epsilon || src >= epsilon)
+      dst = src;
+    else if (src >= 0)
+      dst = epsilon;
+    else
+      dst = -epsilon;
+    __syncthreads();  // This allows it to do consolidated write below, which
+                      // should improve speed.
+    y[y_index] = dst;
+  }
+}
+
 template<typename Real>
 __global__
 static void _parametric_relu(Real* y, const Real* x, MatrixDim d, int src_stride,
@@ -2204,7 +2368,7 @@ static void _diff_parametric_relu(Real* eout, const Real* e, const Real* y,
 
 template<typename Real>
 __global__
-static void _heaviside(Real*y, const Real*x, MatrixDim d, int src_stride) {
+static void _heaviside(Real* y, const Real* x, MatrixDim d, int src_stride) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int j = blockIdx.y * blockDim.y + threadIdx.y;
   int dst_index = i + j * d.stride, src_index = i + j * src_stride;
@@ -2216,8 +2380,124 @@ static void _heaviside(Real*y, const Real*x, MatrixDim d, int src_stride) {
 
 template<typename Real>
 __global__
+static void _exp(Real* y, const Real* x, MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+  if (i < d.cols && j < d.rows) {
+    Real res = exp(x[src_index]);
+    y[dst_index] = res;
+  }
+}
+
+template<typename Real>
+__global__
+static void _pow(Real* y, const Real* x, Real power, MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+  if (i < d.cols && j < d.rows) {
+    y[dst_index] = pow(x[src_index], power);
+  }
+}
+
+template<typename Real>
+__global__
+static void _ceiling(Real* y, const Real* x, Real ceiling_val, MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+
+  if (i < d.cols && j < d.rows) {
+    y[dst_index] = min(x[src_index], ceiling_val);
+  }
+}
+
+template<typename Real>
+__global__
+static void _floor(Real* y, const Real* x, Real floor_val, MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
+  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+
+  if (i < d.cols && j < d.rows) {
+    y[dst_index] = max(x[src_index], floor_val);
+  }
+}
+
+template<typename Real>
+__global__
+static void _exp_limited(Real* y, const Real* x, Real lower_limit, Real upper_limit,
+			 MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+  if (i < d.cols && j < d.rows) {
+    const Real x_i = x[src_index];
+    // I'm writing !(x >= lower_limit) instead of (x < lower_limit) so that
+    // nan's will be set to the lower-limit.
+    if (!(x_i  >= lower_limit))
+      y[dst_index] = exp(lower_limit);
+    else if (x_i > upper_limit)
+      y[dst_index] = exp(upper_limit);
+    else
+      y[dst_index] = exp(x_i);
+  }
+}
+
+/// For each element x of the matrix, set it to
+/// (x < 0 ? exp(x) : x + 1).
+/// Use block/grid sizes for simple matrix ops
+template<typename Real>
+__global__
+static void _exp_special(Real* y, const Real* x, MatrixDim d,
+			 int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+  if (i < d.cols && j < d.rows) {
+    const Real in = x[src_index];
+    if (in < Real(0)) {
+      y[dst_index] = exp(in);
+    } else {
+      y[dst_index] = in + Real(1);
+    }
+  }
+}
+
+template<typename Real>
+__global__
+static void _log(Real* y, const Real* x, MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+  if (i < d.cols && j < d.rows)
+    y[dst_index] = log(x[src_index]);
+}
+
+template<typename Real>
+__global__
+static void _pow_abs(Real* y, const Real* x, Real power, bool include_sign,
+		     MatrixDim d, int src_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;  // col index
+  int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
+  int dst_index = i + j * d.stride, src_index = i + j * src_stride;
+  if (i < d.cols && j < d.rows) {
+    if (include_sign == true && x[src_index] < 0) {
+        y[dst_index] = -pow(std::abs(x[src_index]), power);
+    }
+    else {
+      y[dst_index] = pow(std::abs(x[src_index]), power);
+    }
+  }
+}
+
+template<typename Real>
+__global__
 static void _softmax_reduce(Real*y, const Real*x, MatrixDim d, int src_stride) {
-  __shared__ Real smem[CU1DBLOCK];
+  __shared__ Real smem;
+  typedef cub::BlockReduce<Real, CU1DBLOCK> BlockReduceT;
+  __shared__ typename BlockReduceT::TempStorage temp_storage;
   const int i = blockIdx.x;
   const int x_start = i * src_stride;
   const int y_start = i * d.stride;
@@ -2229,29 +2509,14 @@ static void _softmax_reduce(Real*y, const Real*x, MatrixDim d, int src_stride) {
   for (int j = tid; j < d.cols; j += CU1DBLOCK) {
     tmax = fmax(tmax, x[x_start + j]);
   }
-  smem[tid] = tmax;
-  __syncthreads();
-
-  // reduce to 2x warpSize elements per row
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift) {
-      smem[tid] = fmax(smem[tid], smem[tid + shift]);
-    }
-    __syncthreads();
-  }
-
-  // reduce to 1 element per row
-  if (tid < warpSize) {
-#   pragma unroll
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      smem[tid] = fmax(smem[tid], smem[tid + shift]);
-    }
-  }
+  tmax = BlockReduceT(temp_storage).Reduce(tmax, cub::Max());
 
   // broadcast max to all threads
+  if (tid == 0) {
+    smem = tmax;
+  }
   __syncthreads();
-  Real max = smem[0];
+  Real max = smem;
 
   // sum_j(exp(x(i,j)-max))
   // reduce to CU1DBLOCK elements per row.
@@ -2259,29 +2524,14 @@ static void _softmax_reduce(Real*y, const Real*x, MatrixDim d, int src_stride) {
   for (int j = tid; j < d.cols; j += CU1DBLOCK) {
     tsum += exp(x[x_start + j] - max);
   }
-  smem[tid] = tsum;
-  __syncthreads();
-
-  // reduce to 2x warpSize elements per row
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift) {
-      smem[tid] += smem[tid + shift];
-    }
-    __syncthreads();
-  }
-
-  // reduce to 1 element per row
-  if (tid < warpSize) {
-#   pragma unroll
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      smem[tid] += smem[tid + shift];
-    }
-  }
+  tsum = BlockReduceT(temp_storage).Sum(tsum);
 
   // broadcast sum to all threads
+  if (tid == 0) {
+    smem = tsum;
+  }
   __syncthreads();
-  Real inv_sum = Real(1) / smem[0];
+  Real inv_sum = Real(1) / smem;
 
   // normalize the row
   for (int j = tid; j < d.cols; j += CU1DBLOCK) {
@@ -2310,43 +2560,27 @@ static void _normalize_per_row(Real *y, int y_stride, const Real *x,
   const int i = blockIdx.x;
   const int tid = threadIdx.x;
   const Real* x_row = x + i * x_d.stride;
-  __shared__ Real ssum[CU1DBLOCK];
+
+  typedef cub::BlockReduce<Real, CU1DBLOCK> BlockReduceT;
+  __shared__ typename BlockReduceT::TempStorage temp_storage;
+
+  __shared__ Real stddev_div_target_rms;
+  __shared__ Real scale;
 
   // Reduce x_j^2 to CU1DBLOCK elements per row
   Real tsum = Real(0);
   for (int j = tid; j < x_d.cols; j += CU1DBLOCK) {
     tsum += x_row[j] * x_row[j];
   }
-  ssum[tid] = tsum;
-  __syncthreads();
+  tsum = BlockReduceT(temp_storage).Sum(tsum);
 
-  // Tree reduce to 2x warpSize elements per row
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift)
-      ssum[tid] += ssum[tid + shift];
-    __syncthreads();
-  }
-
-  // Reduce last warp to 1 element per row.
-  // Threads implicitly synchronized within a warp.
-  if (tid < warpSize) {
-#   pragma unroll
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      ssum[tid] += ssum[tid + shift];
-    }
-  }
-
-  const Real kSquaredNormFloor = 1.3552527156068805425e-20; // 2^-66
   if (tid == 0) {
-    ssum[0] = sqrt(
-        fmax(ssum[0] / (target_rms * target_rms * x_d.cols), kSquaredNormFloor));
+    const Real kSquaredNormFloor = 1.3552527156068805425e-20; // 2^-66
+    stddev_div_target_rms = sqrt(
+      fmax(tsum / (target_rms * target_rms * x_d.cols), kSquaredNormFloor));
+    scale = Real(1) / stddev_div_target_rms;
   }
-
-  // Broadcast floored stddev to all threads.
   __syncthreads();
-  const Real stddev_div_target_rms = ssum[0];
-  const Real scale = Real(1) / stddev_div_target_rms;
 
   // Store normalized input to output
   Real* y_row = y + i * y_stride;
@@ -2358,7 +2592,6 @@ static void _normalize_per_row(Real *y, int y_stride, const Real *x,
     y_row[x_d.cols] = log(stddev_div_target_rms * target_rms);
   }
 }
-
 
 template<typename Real>
 __global__
@@ -2454,7 +2687,9 @@ template<typename Real>
 __global__
 static void _log_softmax_reduce(Real* y, const Real* x, MatrixDim y_dim,
                                 int x_stride) {
-  __shared__ Real smem[CU1DBLOCK];
+  __shared__ Real smem;
+  typedef cub::BlockReduce<Real, CU1DBLOCK> BlockReduceT;
+  __shared__ typename BlockReduceT::TempStorage temp_storage;
   const int i = blockIdx.x;
   const int x_start = i * x_stride;
   const int y_start = i * y_dim.stride;
@@ -2466,28 +2701,14 @@ static void _log_softmax_reduce(Real* y, const Real* x, MatrixDim y_dim,
   for (int j = tid; j < y_dim.cols; j += CU1DBLOCK) {
     tmax = fmax(tmax, x[x_start + j]);
   }
-  smem[tid] = tmax;
-  __syncthreads();
-
-  // reduce to 2x warpSize elements per row
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift) {
-      smem[tid] = fmax(smem[tid], smem[tid + shift]);
-    }
-    __syncthreads();
-  }
-
-  // reduce to 1 element per row
-  if (tid < warpSize) {
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      smem[tid] = fmax(smem[tid], smem[tid + shift]);
-    }
-  }
+  tmax = BlockReduceT(temp_storage).Reduce(tmax, cub::Max());
 
   // broadcast max to all threads
+  if (tid == 0) {
+    smem = tmax;
+  }
   __syncthreads();
-  Real max = smem[0];
+  Real max = smem;
 
   // sum_j(exp(x(i,j)-max))
   // reduce to CU1DBLOCK elements per row.
@@ -2495,28 +2716,14 @@ static void _log_softmax_reduce(Real* y, const Real* x, MatrixDim y_dim,
   for (int j = tid; j < y_dim.cols; j += CU1DBLOCK) {
     tsum += exp(x[x_start + j] - max);
   }
-  smem[tid] = tsum;
-  __syncthreads();
-
-  // reduce to 2x warpSize elements per row
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift) {
-      smem[tid] += smem[tid + shift];
-    }
-    __syncthreads();
-  }
-
-  // reduce to 1 element per row
-  if (tid < warpSize) {
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      smem[tid] += smem[tid + shift];
-    }
-  }
+  tsum = BlockReduceT(temp_storage).Sum(tsum);
 
   // broadcast sum to all threads
+  if (tid == 0) {
+    smem = tsum;
+  }
   __syncthreads();
-  Real log_sum = log(smem[0]);
+  Real log_sum = log(smem);
 
   // normalize the row
   for (int j = tid; j < y_dim.cols; j += CU1DBLOCK) {
@@ -2756,7 +2963,10 @@ __global__
 static void _diff_softmax(Real* x, const MatrixDim dim, const Real* value,
                           const int value_stride, const Real* diff,
                           const int diff_stride) {
-  __shared__ Real ssum[CU1DBLOCK];
+  __shared__ Real ssum;
+  typedef cub::BlockReduce<Real, CU1DBLOCK> BlockReduceT;
+  __shared__ typename BlockReduceT::TempStorage temp_storage;
+
   const int tid = threadIdx.x;
   const int i = blockIdx.x;
   const int value_start = i * value_stride;
@@ -2768,29 +2978,14 @@ static void _diff_softmax(Real* x, const MatrixDim dim, const Real* value,
   for (int j = tid; j < dim.cols; j += CU1DBLOCK) {
     tsum += value[value_start + j] * diff[diff_start + j];
   }
-  ssum[tid] = tsum;
-  __syncthreads();
-
-  // Tree reduce to 2x warpSize elements.
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift) {
-      ssum[tid] += ssum[tid + shift];
-    }
-    __syncthreads();
-  }
-
-  // Warp reduce to 1 element. Threads implicitly synchronized within a warp.
-  if (tid < warpSize) {
-#   pragma unroll
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      ssum[tid] += ssum[tid + shift];
-    }
-  }
+  tsum = BlockReduceT(temp_storage).Sum(tsum);
 
   // Broadcast result to all threads
+  if (tid == 0) {
+    ssum = tsum;
+  }
   __syncthreads();
-  const Real pe = ssum[0];
+  const Real pe = ssum;
 
   // Apply element-wise x = value * (diff - pe)
   for (int j = tid; j < dim.cols; j += CU1DBLOCK) {
@@ -2810,7 +3005,9 @@ static void _diff_log_softmax(const MatrixDim in_deriv_dim,
                               const Real* out_deriv, const int out_deriv_stride,
                               Real* in_deriv) {
 
-  __shared__ Real ssum[CU1DBLOCK];
+  __shared__ Real ssum;
+  typedef cub::BlockReduce<Real, CU1DBLOCK> BlockReduceT;
+  __shared__ typename BlockReduceT::TempStorage temp_storage;
   const int tid = threadIdx.x;
   const int i = blockIdx.x;
   const int out_value_start = i * out_value_stride;
@@ -2822,29 +3019,14 @@ static void _diff_log_softmax(const MatrixDim in_deriv_dim,
   for (int j = tid; j < in_deriv_dim.cols; j += CU1DBLOCK) {
     tsum += out_deriv[out_deriv_start + j];
   }
-  ssum[tid] = tsum;
-  __syncthreads();
-
-  // Tree reduce to 2x warpSize elements.
-# pragma unroll
-  for (int shift = CU1DBLOCK / 2; shift > warpSize; shift >>= 1) {
-    if (tid < shift) {
-      ssum[tid] += ssum[tid + shift];
-    }
-    __syncthreads();
-  }
-
-  // Warp reduce to 1 element. Threads implicitly synchronized within a warp.
-  if (tid < warpSize) {
-#   pragma unroll
-    for (int shift = warpSize; shift > 0; shift >>= 1) {
-      ssum[tid] += ssum[tid + shift];
-    }
-  }
+  tsum = BlockReduceT(temp_storage).Sum(tsum);
 
   // Broadcast result to all threads
+  if (tid == 0) {
+    ssum = tsum;
+  }
   __syncthreads();
-  const Real sum_e = ssum[0];
+  const Real sum_e = ssum;
 
   // Apply element-wise x = out_deriv - exp(value) * sum_e
   for (int j = tid; j < in_deriv_dim.cols; j += CU1DBLOCK) {
@@ -3336,6 +3518,177 @@ static void _diff_lstm_nonlinearity(const int cell_dim, const int have_dropout_m
   }
 }
 
+
+__global__
+static void _cuda_compress_uint8_sign(const BaseFloat *src, MatrixDim dim,
+                                      unsigned char *dest, int dest_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dest_index = i + j * dest_stride,
+      src_index = i + j * dim.stride;
+  if (i < dim.cols && j < dim.rows) {
+    BaseFloat f = src[src_index];
+    dest[dest_index] = (f > 0.0 ? (unsigned char)1 : (unsigned char)0);
+  }
+}
+
+
+// The following inline templated functions are a workaround for the
+// fact that (I believe) std::numeric_limits is not available in CUDA;
+// they allow us to access the minimum and maximum elements of certain
+// types from templated code.
+template <typename I> __device__ static inline int minimum_integer_value();
+template <typename I> __device__ static inline int maximum_integer_value();
+
+template<> __device__ int maximum_integer_value<int8_t>() { return 127; }
+template<> __device__ int minimum_integer_value<int8_t>() { return -128; }
+template<> __device__ int maximum_integer_value<uint8_t>() { return 255; }
+template<> __device__ int minimum_integer_value<uint8_t>() { return 0; }
+template<> __device__ int maximum_integer_value<int16_t>() { return 32767; }
+template<> __device__ int minimum_integer_value<int16_t>() { return -32768; }
+template<> __device__ int maximum_integer_value<uint16_t>() { return 65535; }
+template<> __device__ int minimum_integer_value<uint16_t>() { return 0; }
+
+
+
+template <typename I>
+__global__
+static void _cuda_compress_bounds_check(const BaseFloat *src, MatrixDim dim,
+                                        I *dest, int dest_stride, float inv_scale) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dest_index = i + j * dest_stride,
+      src_index = i + j * dim.stride;
+  const int min_value = minimum_integer_value<I>(),
+      max_value = maximum_integer_value<I>();
+  int compressed_value;
+  int ok = (i < dim.cols && j < dim.rows);
+  if  (ok) {
+    float f = src[src_index];
+    // note: I'm not sure what __float2int_rn does if input is outside of
+    // integer range, but it doesn't matter much as in the situations where this
+    // type of compression would make sense, the input should be well inside the
+    // range of 'int', and if it fails, we've probably already catastrophically
+    // diverged.
+    int i = __float2int_rn(f * inv_scale);
+    if (i < min_value) compressed_value = min_value;
+    else if (i > max_value) compressed_value = max_value;
+    else compressed_value = i;
+  }
+  __syncthreads();
+  if (ok) {
+    dest[dest_index] = compressed_value;
+  }
+}
+
+
+template <typename I>
+__global__
+static void _cuda_compress_no_bounds_check(const BaseFloat *src, MatrixDim dim,
+                                           I *dest, int dest_stride,
+                                           float inv_scale) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int dest_index = i + j * dest_stride,
+      src_index = i + j * dim.stride;
+  if (i < dim.cols && j < dim.rows) {
+    float f = src[src_index];
+    int i = __float2int_rn(f * inv_scale);
+    I s = i;
+    dest[dest_index] = s;
+  }
+}
+
+template <typename I>
+__global__
+static void _cuda_uncompress(BaseFloat *dest, MatrixDim dim,
+                             const I *src, int src_stride,
+                             float scale) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int src_index = i + j * src_stride,
+      dest_index = i + j * dim.stride;
+  if (i < dim.cols && j < dim.rows) {
+    I s = src[src_index];
+    dest[dest_index] = float(s * scale);
+  }
+}
+
+template <typename Real>
+__global__
+void _cuda_mat_copy_range_clamped(
+   int32_t row_start, int32_t row_end, int32_t num_cols,
+   const Real * __restrict__ src, int32_t lds, 
+   int32_t clamp_low, int32_t clamp_high,
+   Real * __restrict__ dst, int32_t ldd) {
+  int32_t rid = blockIdx.y*blockDim.y+threadIdx.y;
+  int32_t cid = blockIdx.x*blockDim.x+threadIdx.x;
+
+  int32_t num_rows = row_end - row_start;
+  // for each row in parallel
+  for (int32_t r = rid; r < num_rows; r += blockDim.y * gridDim.y) {
+    // for each column in parallel
+    for (int32_t c = cid; c < num_cols; c += blockDim.x * gridDim.x) {
+      // compute offset row
+      int32_t r_in = r + row_start;
+      // clamp if necessary
+      if (r_in < clamp_low) r_in = clamp_low;
+      if (r_in > clamp_high) r_in = clamp_high;
+
+      // copy data
+      dst[r * ldd + c] = src[r_in * lds + c];
+    }
+  }
+}
+
+template <typename Real> 
+struct MatrixCopyDesc {
+  const Real *input;
+  Real *output;
+  int32_t ldi, ldo;
+  int32_t num_rows, num_cols;
+};
+
+template <typename Real>
+struct  BatchedMatrixCopyDesc {
+  //maximum size allowed in formal parameter list
+  static const int32_t MAX_BATCH_SIZE=128; 
+  MatrixCopyDesc<Real> batch[MAX_BATCH_SIZE];
+};
+
+// launched with a block size of 32x32 (32 rows, 32 cols per CTA)
+// grid dim x,y expands to fill out average in x/y across batches
+// grid dim.z is batch
+template<typename Real>
+__global__ 
+void _cuda_batch_copy_mats(BatchedMatrixCopyDesc<Real> batch_desc) {
+
+  int32_t rid = blockIdx.y * blockDim.y + threadIdx.y;
+  int32_t cid = blockIdx.x * blockDim.x + threadIdx.x;
+  int32_t bid = blockIdx.z;  // batch id 
+
+  // read copy parameters
+  MatrixCopyDesc<Real> desc = batch_desc.batch[bid];
+  int32_t num_rows = desc.num_rows;
+  int32_t num_cols = desc.num_cols;
+  const Real *input = desc.input;
+  Real *output = desc.output;
+  int32_t ldi = desc.ldi;
+  int32_t ldo = desc.ldo;
+
+  // for each row of output in parallel
+  for (int32_t r = rid; r < num_rows; r += blockDim.y * gridDim.y) {
+    // for each of column of output in parallel
+    for (int32_t c = cid; c < num_cols; c+= blockDim.x * gridDim.x) {
+      output[r * ldo + c] = input[r * ldi + c];
+    }
+  }
+}
+
+__global__
+static void _noop_kernel() {
+}
+
 /***********************************************************************
  * ANSI-C wrappers of CUDA kernels
  */
@@ -3350,6 +3703,10 @@ void cuda_int32_set_const(dim3 Gr, dim3 Bl, int32_cuda* mat, int32_cuda value,
 void cuda_int32_add(dim3 Gr, dim3 Bl, int32_cuda* mat, int32_cuda value,
                     MatrixDim d) {
   _add<<<Gr,Bl>>>(mat,value,d);
+}
+void cuda_int32_sequence(dim3 Gr, dim3 Bl, int32_cuda* data, int length,
+                    int32_cuda base) {
+  _sequence<<<Gr, Bl>>>(data, length, base);
 }
 
 /*
@@ -3389,23 +3746,6 @@ void cudaFD_copy_from_tp(dim3 Gr, dim3 Bl, float* A, const double* B,
   _copy_from_tp<<<Gr,Bl>>>(A,B,dmat);
 }
 
-void cudaF_apply_exp(dim3 Gr, dim3 Bl, float* mat, MatrixDim d) {
-  _apply_exp<<<Gr,Bl>>>(mat,d);
-}
-
-void cudaF_apply_pow(dim3 Gr, dim3 Bl, float* mat, float power, MatrixDim d) {
-  _apply_pow<<<Gr,Bl>>>(mat, power, d);
-}
-
-void cudaF_apply_pow_abs(dim3 Gr, dim3 Bl, float* mat, float power,
-                         bool include_sign, MatrixDim d) {
-  _apply_pow_abs<<<Gr,Bl>>>(mat, power, include_sign, d);
-}
-
-void cudaF_apply_heaviside(dim3 Gr, dim3 Bl, float* mat, MatrixDim d) {
-  _apply_heaviside<<<Gr,Bl>>>(mat, d);
-}
-
 void cudaF_copy_cols(dim3 Gr, dim3 Bl, float* dst, const float* src,
                      const MatrixIndexT_cuda* reorder, MatrixDim dst_dim,
                      int src_stride) {
@@ -3440,24 +3780,26 @@ void cudaF_add_rows(dim3 Gr, dim3 Bl, float alpha, float* dst, const float* src,
   _add_rows<<<Gr,Bl>>>(alpha, dst, src, reorder, dst_dim, src_stride);
 }
 
+void cudaF_mul_rows(dim3 Gr, dim3 Bl, float* dst, const float* src,
+                    const MatrixIndexT_cuda* reorder, MatrixDim dst_dim,
+                    int src_stride) {
+  _mul_rows<<<Gr,Bl>>>(dst, src, reorder, dst_dim, src_stride);
+}
+
 void cudaF_add_rows_direct(dim3 Gr, dim3 Bl, float alpha, float* dst,
                            const float* const * src, MatrixDim dst_dim) {
   _add_rows<<<Gr,Bl>>>(alpha, dst, src, dst_dim);
 }
 
+void cudaF_add_to_rows(dim3 Gr, dim3 Bl, float alpha,
+                       float* dst, const float* src, const MatrixIndexT_cuda* reorder,
+                       MatrixDim src_dim, int dst_stride) {
+  _add_to_rows<<<Gr,Bl>>>(alpha, dst, src, reorder, src_dim, dst_stride);
+}
+
 void cudaF_add_to_rows_direct(dim3 Gr, dim3 Bl, float alpha, float* const * dst,
                               const float* src, MatrixDim src_dim) {
   _add_to_rows<<<Gr,Bl>>>(alpha, dst, src, src_dim);
-}
-
-void cudaF_apply_floor(dim3 Gr, dim3 Bl, float* mat, float floor_val,
-                       MatrixDim d) {
-  _apply_floor<<<Gr,Bl>>>(mat, floor_val, d);
-}
-
-void cudaF_apply_ceiling(dim3 Gr, dim3 Bl, float* mat, float ceiling_val,
-                         MatrixDim d) {
-  _apply_ceiling<<<Gr,Bl>>>(mat, ceiling_val, d);
 }
 
 void cudaF_set_diag(int Gr, int Bl, float* mat, float value, MatrixDim d) {
@@ -3490,10 +3832,6 @@ void cudaF_scale_diag_packed(int Gr, int Bl, float* mat, float value, int dim) {
 
 void cudaF_scale(dim3 Gr, dim3 Bl, float* mat, float value, MatrixDim d) {
   _scale<<<Gr,Bl>>>(mat,value,d);
-}
-
-void cudaF_apply_log(dim3 Gr, dim3 Bl, float* mat, MatrixDim d) {
-  _apply_log<<<Gr,Bl>>>(mat,d);
 }
 
 void cudaF_mul_elements(dim3 Gr, dim3 Bl, float* mat, const float* A,
@@ -3642,12 +3980,19 @@ void cudaF_sum_mat_cols(int Gr, int Bl, float* result, const float* mat,
   _transform_reduce_mat_cols<<<Gr,Bl>>>(result,mat,d,
       TransReduceOp<SUM,float>());
 }
+void cudaF_add_row_sum_mat(int Gr, int Bl, float* result, const float* mat,
+                           const MatrixDim d, const float alpha,
+                           const float beta) {
+  _transform_reduce_mat_rows<<<Gr, Bl>>>(result, mat, d,
+      TransReduceOp<SUMAB, float>(alpha, beta));
+}
 void cudaF_add_col_sum_mat(int Gr, int Bl, float* result, const float* mat,
                            const MatrixDim d, const float alpha,
                            const float beta) {
   _transform_reduce_mat_cols<<<Gr, Bl>>>(result, mat, d,
       TransReduceOp<SUMAB, float>(alpha, beta));
 }
+
 
 void cudaF_replace_value(int Gr, int Bl, float *v, int dim, float orig,
                          float changed) {
@@ -3706,11 +4051,14 @@ void cudaF_add_diag_mat_mat_MNT(int Gr, int Bl, const float alpha,
 void cudaF_add_diag_mat_mat_MTN(dim3 Gr, dim3 Bl, const float alpha,
                                 const float* M, const int stride_M,
                                 const float* N, const MatrixDim dim_N,
-                                const float beta, float* v) {
+                                const float beta, float* v,
+                                const int stride_v) {
   if (Bl.x == 16) {
-    _add_diag_mat_mat_MTN<16> <<<Gr,Bl>>>(alpha,M,stride_M,N,dim_N,beta,v);
-  } else if (Bl.x==32) {
-    _add_diag_mat_mat_MTN<32><<<Gr,Bl>>>(alpha,M,stride_M,N,dim_N,beta,v);
+    _add_diag_mat_mat_MTN<16> <<<Gr, Bl>>>(alpha, M, stride_M, N, dim_N, beta,
+                                           v, stride_v);
+  } else if (Bl.x == 32) {
+    _add_diag_mat_mat_MTN<32> <<<Gr, Bl>>>(alpha, M, stride_M, N, dim_N, beta,
+                                           v, stride_v);
   }
 }
 
@@ -3745,6 +4093,20 @@ void cudaF_matrix_add_indexed_values(dim3 Gr, dim3 Bl, MatrixDim dim,
                                      float alpha, const Int32Pair* indices,
                                      const float* x, int s, float* data) {
   _cuda_matrix_add_indexed_values<<<Gr, Bl>>>(dim, alpha, indices, x, s, data);
+}
+
+void cudaF_matrix_add_to_elements(dim3 Gr, dim3 Bl, float alpha,
+                                  float* mat, MatrixDim dim,
+                                  const MatrixIndexT_cuda* elements) {
+  _cuda_matrix_add_to_elements<<<Gr, Bl>>>(alpha, mat, dim, elements);
+}
+
+void cudaF_vector_copy_elements(dim3 Gr, dim3 Bl, float *data, int dim,
+                                const float *src_mat, int mat_stride,
+                                bool transpose,
+                                const MatrixIndexT_cuda* elements) {
+  _cuda_vector_copy_elements<<<Gr, Bl>>>(data, dim, src_mat, mat_stride,
+                                         transpose, elements);
 }
 
 void cudaF_comp_obj_deriv(dim3 Gr, dim3 Bl, MatrixElement<float>* x, int s,
@@ -3873,6 +4235,12 @@ void cudaF_diff_tanh(dim3 Gr, dim3 Bl, float* eout, const float* e,
   _diff_tanh<<<Gr,Bl>>>(eout, e, y, d, e_stride, y_stride);
 }
 
+void cudaF_ensure_nonzero(dim3 Gr, dim3 Bl, const float *x, MatrixDim d,
+                          float epsilon, int y_stride, float *y) {
+  _ensure_nonzero<<<Gr,Bl>>>(x, d, epsilon, y_stride, y);
+}
+
+
 void cudaF_parametric_relu(dim3 Gr, dim3 Bl, float* y, const float* x,
                            MatrixDim d, int src_stride,
                            const float* a, const float* b) {
@@ -3888,6 +4256,45 @@ void cudaF_diff_parametric_relu(dim3 Gr, dim3 Bl, float* eout, const float* e,
 void cudaF_heaviside(dim3 Gr, dim3 Bl, float* y, const float* x, MatrixDim d,
                      int src_stride) {
   _heaviside<<<Gr,Bl>>>(y, x, d, src_stride);
+}
+
+void cudaF_exp(dim3 Gr, dim3 Bl, float* y, const float* x, MatrixDim d,
+	       int src_stride) {
+  _exp<<<Gr,Bl>>>(y, x, d, src_stride);
+}
+
+void cudaF_pow(dim3 Gr, dim3 Bl, float* y, const float* x, float power, MatrixDim d,
+	       int src_stride) {
+  _pow<<<Gr,Bl>>>(y, x, power, d, src_stride);
+}
+
+void cudaF_ceiling(dim3 Gr, dim3 Bl, float* y, const float* x, float ceiling_val,
+		   MatrixDim d, int src_stride) {
+  _ceiling<<<Gr,Bl>>>(y, x, ceiling_val, d, src_stride);
+}
+
+void cudaF_floor(dim3 Gr, dim3 Bl, float* y, const float* x, float floor_val,
+		 MatrixDim d, int src_stride) {
+  _floor<<<Gr,Bl>>>(y, x, floor_val, d, src_stride);
+}
+
+void cudaF_exp_limited(dim3 Gr, dim3 Bl, float* y, const float* x,
+		       float lower_limit, float upper_limit, MatrixDim d, int src_stride) {
+  _exp_limited<<<Gr,Bl>>>(y, x, lower_limit, upper_limit, d, src_stride);
+}
+
+void cudaF_exp_special(dim3 Gr, dim3 Bl, float* y, const float* x, MatrixDim d,
+		       int src_stride) {
+  _exp_special<<<Gr, Bl>>>(y, x, d, src_stride);
+}
+
+void cudaF_log(dim3 Gr, dim3 Bl, float* y, const float* x, MatrixDim d, int src_stride) {
+  _log<<<Gr,Bl>>>(y, x, d, src_stride);
+}
+
+void cudaF_pow_abs(dim3 Gr, dim3 Bl, float* y, const float* x, float power,
+		   bool include_sign, MatrixDim d, int src_stride) {
+  _pow_abs<<<Gr,Bl>>>(y, x, power, include_sign, d, src_stride);
 }
 
 void cudaF_softmax_reduce(size_t Gr, size_t Bl, float* y, const float* x,
@@ -4053,23 +4460,6 @@ void cudaDF_copy_from_tp(dim3 Gr, dim3 Bl, double* A, const float* B,
   _copy_from_tp<<<Gr,Bl>>>(A,B,dmat);
 }
 
-void cudaD_apply_exp(dim3 Gr, dim3 Bl, double* mat, MatrixDim d) {
-  _apply_exp<<<Gr,Bl>>>(mat,d);
-}
-
-void cudaD_apply_pow(dim3 Gr, dim3 Bl, double* mat, double power, MatrixDim d) {
-  _apply_pow<<<Gr,Bl>>>(mat, power, d);
-}
-
-void cudaD_apply_pow_abs(dim3 Gr, dim3 Bl, double* mat, double power,
-                         bool include_sign, MatrixDim d) {
-  _apply_pow_abs<<<Gr,Bl>>>(mat, power, include_sign, d);
-}
-
-void cudaD_apply_heaviside(dim3 Gr, dim3 Bl, double* mat, MatrixDim d) {
-  _apply_heaviside<<<Gr,Bl>>>(mat, d);
-}
-
 void cudaD_copy_cols(dim3 Gr, dim3 Bl, double* dst, const double* src,
                      const MatrixIndexT_cuda* reorder, MatrixDim dst_dim,
                      int src_stride) {
@@ -4104,25 +4494,27 @@ void cudaD_add_rows(dim3 Gr, dim3 Bl, double alpha, double* dst,
   _add_rows<<<Gr,Bl>>>(alpha, dst, src, reorder, dst_dim, src_stride);
 }
 
+void cudaD_mul_rows(dim3 Gr, dim3 Bl, double* dst,
+                    const double* src, const MatrixIndexT_cuda* reorder,
+                    MatrixDim dst_dim, int src_stride) {
+  _mul_rows<<<Gr,Bl>>>(dst, src, reorder, dst_dim, src_stride);
+}
+
 void cudaD_add_rows_direct(dim3 Gr, dim3 Bl, double alpha, double* dst,
                            const double* const * src, MatrixDim dst_dim) {
   _add_rows<<<Gr,Bl>>>(alpha, dst, src, dst_dim);
+}
+
+void cudaD_add_to_rows(dim3 Gr, dim3 Bl, double alpha,
+                       double* dst, const double* src, const MatrixIndexT_cuda* reorder,
+                       MatrixDim src_dim, int dst_stride) {
+  _add_to_rows<<<Gr,Bl>>>(alpha, dst, src, reorder, src_dim, dst_stride);
 }
 
 void cudaD_add_to_rows_direct(dim3 Gr, dim3 Bl, double alpha,
                               double* const * dst, const double* src,
                               MatrixDim src_dim) {
   _add_to_rows<<<Gr,Bl>>>(alpha, dst, src, src_dim);
-}
-
-void cudaD_apply_floor(dim3 Gr, dim3 Bl, double* mat, double floor_val,
-                       MatrixDim d) {
-  _apply_floor<<<Gr,Bl>>>(mat, floor_val, d);
-}
-
-void cudaD_apply_ceiling(dim3 Gr, dim3 Bl, double* mat, double ceiling_val,
-                         MatrixDim d) {
-  _apply_ceiling<<<Gr,Bl>>>(mat, ceiling_val, d);
 }
 
 void cudaD_set_diag(int Gr, int Bl, double* mat, double value, MatrixDim d) {
@@ -4156,10 +4548,6 @@ void cudaD_scale_diag_packed(int Gr, int Bl, double* mat, double value,
 
 void cudaD_scale(dim3 Gr, dim3 Bl, double* mat, double value, MatrixDim d) {
   _scale<<<Gr,Bl>>>(mat,value,d);
-}
-
-void cudaD_apply_log(dim3 Gr, dim3 Bl, double* mat, MatrixDim d) {
-  _apply_log<<<Gr,Bl>>>(mat,d);
 }
 
 void cudaD_mul_elements(dim3 Gr, dim3 Bl, double* mat, const double* A,
@@ -4308,6 +4696,12 @@ void cudaD_sum_mat_cols(int Gr, int Bl, double* result, const double* mat,
   _transform_reduce_mat_cols<<<Gr,Bl>>>(result,mat,d,
       TransReduceOp<SUM,double>());
 }
+void cudaD_add_row_sum_mat(int Gr, int Bl, double* result, const double* mat,
+                           const MatrixDim d, const double alpha,
+                           const double beta) {
+  _transform_reduce_mat_rows<<<Gr, Bl>>>(result, mat, d,
+      TransReduceOp<SUMAB, double>(alpha, beta));
+}
 void cudaD_add_col_sum_mat(int Gr, int Bl, double* result, const double* mat,
                            const MatrixDim d, const double alpha,
                            const double beta) {
@@ -4364,11 +4758,14 @@ void cudaD_add_diag_mat_mat_MNT(int Gr, int Bl, const double alpha,
 void cudaD_add_diag_mat_mat_MTN(dim3 Gr, dim3 Bl, const double alpha,
                                 const double* M, const int stride_M,
                                 const double* N, const MatrixDim dim_N,
-                                const double beta, double* v) {
+                                const double beta, double* v,
+                                const int stride_v) {
   if (Bl.x == 16) {
-    _add_diag_mat_mat_MTN<16> <<<Gr,Bl>>>(alpha,M,stride_M,N,dim_N,beta,v);
-  } else if (Bl.x==32) {
-    _add_diag_mat_mat_MTN<32><<<Gr,Bl>>>(alpha,M,stride_M,N,dim_N,beta,v);
+    _add_diag_mat_mat_MTN<16> <<<Gr, Bl>>>(alpha, M, stride_M, N, dim_N, beta,
+                                           v, stride_v);
+  } else if (Bl.x == 32) {
+    _add_diag_mat_mat_MTN<32> <<<Gr, Bl>>>(alpha, M, stride_M, N, dim_N, beta,
+                                           v, stride_v);
   }
 }
 
@@ -4409,10 +4806,24 @@ void cudaD_matrix_add_elements(dim3 Gr, dim3 Bl, double *data, MatrixDim dim,
   _cuda_matrix_add_elements<<<Gr, Bl>>>(data, dim, alpha, x, num_elements);
 }
 
+void cudaD_vector_copy_elements(dim3 Gr, dim3 Bl, double *data, int dim,
+                                const double *src_mat, int mat_stride,
+                                bool transpose,
+                                const MatrixIndexT_cuda* elements) {
+  _cuda_vector_copy_elements<<<Gr, Bl>>>(data, dim, src_mat, mat_stride,
+                                         transpose, elements);
+}
+
 void cudaD_matrix_add_indexed_values(dim3 Gr, dim3 Bl, MatrixDim dim,
                                      double alpha, const Int32Pair* indices,
                                      const double* x, int s, double* data) {
   _cuda_matrix_add_indexed_values<<<Gr, Bl>>>(dim, alpha, indices, x, s, data);
+}
+
+void cudaD_matrix_add_to_elements(dim3 Gr, dim3 Bl, double alpha,
+                                  double* mat, MatrixDim dim,
+                                  const MatrixIndexT_cuda* elements) {
+  _cuda_matrix_add_to_elements<<<Gr, Bl>>>(alpha, mat, dim, elements);
 }
 
 void cudaD_vec_copy_diag_from_packed(int Gr, int Bl, double *dst,
@@ -4529,6 +4940,11 @@ void cudaD_diff_tanh(dim3 Gr, dim3 Bl, double* eout, const double* e,
   _diff_tanh<<<Gr,Bl>>>(eout, e, y, d, e_stride, y_stride);
 }
 
+void cudaD_ensure_nonzero(dim3 Gr, dim3 Bl, const double *x, MatrixDim d,
+                          double epsilon, int y_stride, double *y) {
+  _ensure_nonzero<<<Gr,Bl>>>(x, d, epsilon, y_stride, y);
+}
+
 void cudaD_parametric_relu(dim3 Gr, dim3 Bl, double* y, const double* x,
                            MatrixDim d, int src_stride,
                            const double* a, const double* b) {
@@ -4544,6 +4960,45 @@ void cudaD_diff_parametric_relu(dim3 Gr, dim3 Bl, double* eout, const double* e,
 void cudaD_heaviside(dim3 Gr, dim3 Bl, double* y, const double* x, MatrixDim d,
                      int src_stride) {
   _heaviside<<<Gr,Bl>>>(y, x, d, src_stride);
+}
+
+void cudaD_exp(dim3 Gr, dim3 Bl, double* y, const double* x, MatrixDim d,
+	       int src_stride) {
+  _exp<<<Gr,Bl>>>(y, x, d, src_stride);
+}
+
+void cudaD_pow(dim3 Gr, dim3 Bl, double* y, const double* x, double power, MatrixDim d,
+	       int src_stride) {
+  _pow<<<Gr,Bl>>>(y, x, power, d, src_stride);
+}
+
+void cudaD_ceiling(dim3 Gr, dim3 Bl, double* y, const double* x, double ceiling_val,
+		   MatrixDim d, int src_stride) {
+  _ceiling<<<Gr,Bl>>>(y, x, ceiling_val, d, src_stride);
+}
+
+void cudaD_floor(dim3 Gr, dim3 Bl, double* y, const double* x, double floor_val,
+		 MatrixDim d, int src_stride) {
+  _floor<<<Gr,Bl>>>(y, x, floor_val, d, src_stride);
+}
+
+void cudaD_exp_limited(dim3 Gr, dim3 Bl, double* y, const double* x,
+		       double lower_limit, double upper_limit, MatrixDim d, int src_stride) {
+  _exp_limited<<<Gr,Bl>>>(y, x, lower_limit, upper_limit, d, src_stride);
+}
+
+void cudaD_exp_special(dim3 Gr, dim3 Bl, double* y, const double* x, MatrixDim d,
+		       int src_stride) {
+  _exp_special<<<Gr, Bl>>>(y, x, d, src_stride);
+}
+
+void cudaD_log(dim3 Gr, dim3 Bl, double* y, const double* x, MatrixDim d, int src_stride) {
+  _log<<<Gr,Bl>>>(y, x, d, src_stride);
+}
+
+void cudaD_pow_abs(dim3 Gr, dim3 Bl, double* y, const double* x, double power,
+		   bool include_sign, MatrixDim d, int src_stride) {
+  _pow_abs<<<Gr,Bl>>>(y, x, power, include_sign, d, src_stride);
 }
 
 void cudaD_softmax_reduce(size_t Gr, size_t Bl, double* y, const double* x,
@@ -4713,75 +5168,87 @@ void cuda_copy_from_mat_dd_trans(dim3 Gr, dim3 Bl, double *mat_out,
   _copy_from_mat_trans<32> <<<Gr,Bl>>>(mat_out,mat_in,d_out,d_in);
 }
 
-void cuda_copy_from_smat_ff(dim3 Gr, dim3 Bl, float* mat_out,
-                            const MatrixElement<float>* smat_in,
-                            MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_ff(dim3 Gr, dim3 Bl, float* mat, MatrixDim mat_dim,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const float* smat_val) {
+  _copy_from_smat<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                              smat_val);
 }
-void cuda_copy_from_smat_fd(dim3 Gr, dim3 Bl, float* mat_out,
-                            const MatrixElement<double>* smat_in,
-                            MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_fd(dim3 Gr, dim3 Bl, float* mat, MatrixDim mat_dim,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const double* smat_val) {
+  _copy_from_smat<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                              smat_val);
 }
-void cuda_copy_from_smat_df(dim3 Gr, dim3 Bl, double* mat_out,
-                            const MatrixElement<float>* smat_in,
-                            MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_df(dim3 Gr, dim3 Bl, double* mat, MatrixDim mat_dim,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const float* smat_val) {
+  _copy_from_smat<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                              smat_val);
 }
-void cuda_copy_from_smat_dd(dim3 Gr, dim3 Bl, double* mat_out,
-                            const MatrixElement<double>* smat_in,
-                            MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_dd(dim3 Gr, dim3 Bl, double* mat, MatrixDim mat_dim,
+                            const int* smat_row_ptr, const int* smat_col_idx,
+                            const double* smat_val) {
+  _copy_from_smat<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                              smat_val);
 }
-void cuda_copy_from_smat_ff_trans(dim3 Gr, dim3 Bl, float* mat_out,
-                                  const MatrixElement<float>* smat_in,
-                                  MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat_trans<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_ff_trans(dim3 Gr, dim3 Bl, float* mat,
+                                  MatrixDim mat_dim, const int* smat_row_ptr,
+                                  const int* smat_col_idx,
+                                  const float* smat_val) {
+  _copy_from_smat_trans<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                                    smat_val);
 }
-void cuda_copy_from_smat_fd_trans(dim3 Gr, dim3 Bl, float* mat_out,
-                                  const MatrixElement<double>* smat_in,
-                                  MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat_trans<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_fd_trans(dim3 Gr, dim3 Bl, float* mat,
+                                  MatrixDim mat_dim, const int* smat_row_ptr,
+                                  const int* smat_col_idx,
+                                  const double* smat_val) {
+  _copy_from_smat_trans<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                                    smat_val);
 }
-void cuda_copy_from_smat_df_trans(dim3 Gr, dim3 Bl, double* mat_out,
-                                  const MatrixElement<float>* smat_in,
-                                  MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat_trans<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_df_trans(dim3 Gr, dim3 Bl, double* mat,
+                                  MatrixDim mat_dim, const int* smat_row_ptr,
+                                  const int* smat_col_idx,
+                                  const float* smat_val) {
+  _copy_from_smat_trans<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                                    smat_val);
 }
-void cuda_copy_from_smat_dd_trans(dim3 Gr, dim3 Bl, double* mat_out,
-                                  const MatrixElement<double>* smat_in,
-                                  MatrixDim d_out, MatrixIndexT_cuda d_in) {
-  _copy_from_smat_trans<<<Gr,Bl>>>(mat_out, smat_in, d_out, d_in);
+void cuda_copy_from_smat_dd_trans(dim3 Gr, dim3 Bl, double* mat,
+                                  MatrixDim mat_dim, const int* smat_row_ptr,
+                                  const int* smat_col_idx,
+                                  const double* smat_val) {
+  _copy_from_smat_trans<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                                    smat_val);
 }
 
-void cudaF_trace_mat_smat(dim3 Gr, dim3 Bl, const float* mat_in,
-                          const MatrixElement<float>* smat_in,
-                          MatrixDim mat_d_in, MatrixIndexT_cuda smat_d_in,
-                          float* trace_vec_out) {
-  _trace_mat_smat<<<Gr,Bl>>>(mat_in, smat_in, mat_d_in, smat_d_in,
-      trace_vec_out);
+void cudaF_trace_mat_smat(dim3 Gr, dim3 Bl, const float* mat, MatrixDim mat_dim,
+                          const int* smat_row_ptr, const int* smat_col_idx,
+                          const float* smat_val, float* trace_vec) {
+  _trace_mat_smat<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                              smat_val, trace_vec);
 }
-void cudaF_trace_mat_smat_trans(dim3 Gr, dim3 Bl, const float* mat_in,
-                                const MatrixElement<float>* smat_in,
-                                MatrixDim mat_d_in, MatrixIndexT_cuda smat_d_in,
-                                float* trace_vec_out) {
-  _trace_mat_smat_trans<<<Gr,Bl>>>(mat_in, smat_in, mat_d_in, smat_d_in,
-      trace_vec_out);
+void cudaF_trace_mat_smat_trans(dim3 Gr, dim3 Bl, const float* mat,
+                                MatrixDim mat_dim, const int* smat_row_ptr,
+                                const int* smat_col_idx, const float* smat_val,
+                                float* trace_vec) {
+  _trace_mat_smat_trans<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                                    smat_val, trace_vec);
 }
-void cudaD_trace_mat_smat(dim3 Gr, dim3 Bl, const double* mat_in,
-                          const MatrixElement<double>* smat_in,
-                          MatrixDim mat_d_in, MatrixIndexT_cuda smat_d_in,
-                          double* trace_vec_out) {
-  _trace_mat_smat<<<Gr,Bl>>>(mat_in, smat_in, mat_d_in, smat_d_in,
-      trace_vec_out);
+void cudaD_trace_mat_smat(dim3 Gr, dim3 Bl, const double* mat,
+                          MatrixDim mat_dim, const int* smat_row_ptr,
+                          const int* smat_col_idx, const double* smat_val,
+                          double* trace_vec) {
+  _trace_mat_smat<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                              smat_val, trace_vec);
 }
-void cudaD_trace_mat_smat_trans(dim3 Gr, dim3 Bl, const double* mat_in,
-                                const MatrixElement<double>* smat_in,
-                                MatrixDim mat_d_in, MatrixIndexT_cuda smat_d_in,
-                                double* trace_vec_out) {
-  _trace_mat_smat_trans<<<Gr,Bl>>>(mat_in, smat_in, mat_d_in, smat_d_in,
-      trace_vec_out);
+void cudaD_trace_mat_smat_trans(dim3 Gr, dim3 Bl, const double* mat,
+                                MatrixDim mat_dim, const int* smat_row_ptr,
+                                const int* smat_col_idx, const double* smat_val,
+                                double* trace_vec) {
+  _trace_mat_smat_trans<<<Gr, Bl>>>(mat, mat_dim, smat_row_ptr, smat_col_idx,
+                                    smat_val, trace_vec);
 }
+
 void cudaD_lstm_nonlinearity(dim3 Gr, dim3 Bl, const double* in,
                              const int in_stride, const double* params,
                              const int params_stride, const int out_stride,
@@ -4882,4 +5349,275 @@ void cudaD_diff_normalize_per_row(size_t Gr, size_t Bl, double *id,
                                   bool add_log_stddev) {
   _diff_normalize_per_row<<<Gr, Bl>>>(id, id_stride, iv, iv_dim, od, od_stride,
                                       target_rms, add_log_stddev);
+}
+void cudaD_select_rows(dim3 Gr, dim3 Bl, const int* out_row_ptr,
+                       int* out_col_idx, double* out_val,
+                       const int* row_indexes, const int num_selected_rows,
+                       const int* in_row_ptr, const int* in_col_idx,
+                       const double* in_val) {
+  _select_rows<<<Gr, Bl>>>(out_row_ptr, out_col_idx, out_val, row_indexes,
+                           num_selected_rows, in_row_ptr, in_col_idx, in_val);
+}
+void cudaF_select_rows(dim3 Gr, dim3 Bl, const int* out_row_ptr,
+                       int* out_col_idx, float* out_val, const int* row_indexes,
+                       const int num_selected_rows, const int* in_row_ptr,
+                       const int* in_col_idx, const float* in_val) {
+  _select_rows<<<Gr, Bl>>>(out_row_ptr, out_col_idx, out_val, row_indexes,
+                           num_selected_rows, in_row_ptr, in_col_idx, in_val);
+}
+void cudaD_add_smat(dim3 Gr, dim3 Bl, double* mat, MatrixDim mat_dim,
+                    double alpha, const int* smat_row_ptr,
+                    const int* smat_col_idx, const double* smat_val) {
+  _add_smat<<<Gr, Bl>>>(mat, mat_dim, alpha, smat_row_ptr, smat_col_idx,
+                        smat_val);
+}
+void cudaF_add_smat(dim3 Gr, dim3 Bl, float* mat, MatrixDim mat_dim,
+                    float alpha, const int* smat_row_ptr,
+                    const int* smat_col_idx, const float* smat_val) {
+  _add_smat<<<Gr, Bl>>>(mat, mat_dim, alpha, smat_row_ptr, smat_col_idx,
+                        smat_val);
+}
+void cudaD_add_smat_trans(dim3 Gr, dim3 Bl, double* mat, MatrixDim mat_dim,
+                          double alpha, const int* smat_row_ptr,
+                          const int* smat_col_idx, const double* smat_val) {
+  _add_smat_trans<<<Gr, Bl>>>(mat, mat_dim, alpha, smat_row_ptr, smat_col_idx,
+                              smat_val);
+}
+void cudaF_add_smat_trans(dim3 Gr, dim3 Bl, float* mat, MatrixDim mat_dim,
+                          float alpha, const int* smat_row_ptr,
+                          const int* smat_col_idx, const float* smat_val) {
+  _add_smat_trans<<<Gr, Bl>>>(mat, mat_dim, alpha, smat_row_ptr, smat_col_idx,
+                              smat_val);
+}
+
+void cuda_compress_uint8_sign(dim3 Gr, dim3 Bl, const BaseFloat *src, MatrixDim dim,
+                              unsigned char *dest, int dest_stride) {
+  _cuda_compress_uint8_sign<<<Gr, Bl>>>(src, dim, dest, dest_stride);
+}
+
+void cuda_compress_int16(dim3 Gr, dim3 Bl, const BaseFloat *src,
+                         MatrixDim dim, int16_t *dest,
+                         int dest_stride, float inv_scale,
+                         bool bounds_check) {
+  if (bounds_check) {
+    _cuda_compress_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  } else {
+    _cuda_compress_no_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  }
+}
+void cuda_compress_uint16(dim3 Gr, dim3 Bl, const BaseFloat *src,
+                         MatrixDim dim, uint16_t *dest,
+                         int dest_stride, float inv_scale,
+                         bool bounds_check) {
+  if (bounds_check) {
+    _cuda_compress_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  } else {
+    _cuda_compress_no_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  }
+}
+void cuda_compress_int8(dim3 Gr, dim3 Bl, const BaseFloat *src,
+                         MatrixDim dim, int8_t *dest,
+                         int dest_stride, float inv_scale,
+                         bool bounds_check) {
+  if (bounds_check) {
+    _cuda_compress_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  } else {
+    _cuda_compress_no_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  }
+}
+void cuda_compress_uint8(dim3 Gr, dim3 Bl, const BaseFloat *src,
+                         MatrixDim dim, uint8_t *dest,
+                         int dest_stride, float inv_scale,
+                         bool bounds_check) {
+  if (bounds_check) {
+    _cuda_compress_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  } else {
+    _cuda_compress_no_bounds_check<<<Gr, Bl>>>(src, dim, dest, dest_stride, inv_scale);
+  }
+}
+
+void cuda_uncompress_uint8(dim3 Gr, dim3 Bl, BaseFloat *dest,
+                           MatrixDim dim, const uint8_t *src,
+                           int src_stride, float scale) {
+  _cuda_uncompress<<<Gr, Bl>>>(dest, dim, src, src_stride, scale);
+}
+void cuda_uncompress_int8(dim3 Gr, dim3 Bl, BaseFloat *dest,
+                           MatrixDim dim, const int8_t *src,
+                           int src_stride, float scale) {
+  _cuda_uncompress<<<Gr, Bl>>>(dest, dim, src, src_stride, scale);
+}
+void cuda_uncompress_uint16(dim3 Gr, dim3 Bl, BaseFloat *dest,
+                            MatrixDim dim, const uint16_t *src,
+                            int src_stride, float scale) {
+  _cuda_uncompress<<<Gr, Bl>>>(dest, dim, src, src_stride, scale);
+}
+void cuda_uncompress_int16(dim3 Gr, dim3 Bl, BaseFloat *dest,
+                           MatrixDim dim, const int16_t *src,
+                           int src_stride, float scale) {
+  _cuda_uncompress<<<Gr, Bl>>>(dest, dim, src, src_stride, scale);
+}
+
+
+// Launches a kernel that does nothing, explicitly using the legacy default stream;
+// this will synchronize all threads without blocking.
+void cuda_legacy_noop() {
+  _noop_kernel<<<1, 1, 0, cudaStreamLegacy>>>();
+}
+
+void cudaF_mat_copy_range_clamped(
+   int32_t row_start, int32_t row_end, int32_t num_cols,
+   const float *src, int32_t lds, 
+   int32_t clamp_low, int32_t clamp_high,
+   float *dst, int32_t ldd) {
+
+  int32_t num_rows =  row_end - row_start;
+  dim3 threads(32,32);
+  dim3 blocks((num_cols+31)/32,(num_rows+31)/32);
+
+  _cuda_mat_copy_range_clamped<float><<<blocks,threads>>>(row_start, row_end, num_cols,
+      src, lds, clamp_low, clamp_high, dst, ldd);
+}
+
+void cudaD_mat_copy_range_clamped(
+   int32_t row_start, int32_t row_end, int32_t num_cols,
+   const double *src, int32_t lds, 
+   int32_t clamp_low, int32_t clamp_high,
+   double *dst, int32_t ldd) {
+
+  int32_t num_rows =  row_end - row_start;
+  dim3 threads(32,32);
+  dim3 blocks((num_cols+31)/32,(num_rows+31)/32);
+
+  _cuda_mat_copy_range_clamped<double><<<blocks,threads>>>(row_start, row_end, num_cols,
+      src, lds, clamp_low, clamp_high, dst, ldd);
+}
+
+void cudaF_batched_copy_mats(int32_t num_mats, int32_t *num_rows,
+    int32_t *num_cols, const float **inputs, int32_t *ldi, float **outputs,
+    int32_t *ldo) {
+
+  dim3 threads(32,32);
+  int32_t total_rows=0, total_cols=0;
+  
+  BatchedMatrixCopyDesc<float> batch_desc; 
+  const int32_t MAX_BATCH_SIZE=batch_desc.MAX_BATCH_SIZE;
+
+  int i;
+  for (i = 0; i < num_mats; i++) {
+    int b = i%MAX_BATCH_SIZE;
+    
+    // fill in desc
+    MatrixCopyDesc<float> &desc = batch_desc.batch[b];
+    desc.num_rows = num_rows[i];
+    desc.num_cols = num_cols[i];
+    desc.input = inputs[i];
+    desc.output = outputs[i];
+    desc.ldi = ldi[i];
+    desc.ldo = ldo[i];
+
+    total_rows+=desc.num_rows;
+    total_cols+=desc.num_cols;
+
+    if (b==MAX_BATCH_SIZE-1) {
+      // compute average number of rows/cols across batch
+      int32_t rows = ceilf(total_rows / (float)MAX_BATCH_SIZE);
+      int32_t cols = ceilf(total_cols / (float)MAX_BATCH_SIZE);
+      dim3 blocks((cols + 31) / 32,
+                  (rows + 31) / 32, 
+                  MAX_BATCH_SIZE);
+
+      // no memcpy needed here.  Memory will be passed down directly
+      // through paramter passing and live in constant memory
+      
+      // launch batch
+       _cuda_batch_copy_mats<<<blocks,threads>>>(batch_desc);
+
+       // reset total counters
+       total_rows=0;
+       total_cols=0;
+    }
+  }
+
+  int32_t remaining = i%MAX_BATCH_SIZE;
+
+  if (remaining > 0) {
+      // compute average number of rows/cols across batch
+      int32_t rows = ceilf(total_rows / (float)remaining);
+      int32_t cols = ceilf(total_cols / (float)remaining);
+      
+      dim3 blocks((cols + 31) / 32,
+                  (rows + 31) / 32, 
+                  remaining);
+
+      // no memcpy needed here.  Memory will be passed down directly
+      // through paramter passing and live in constant memory
+
+      // launch batch
+       _cuda_batch_copy_mats<<<blocks,threads>>>(batch_desc);
+  }
+}
+
+void cudaD_batched_copy_mats(int32_t num_mats, int32_t *num_rows,
+    int32_t *num_cols, const double **inputs, int32_t *ldi, double **outputs,
+    int32_t *ldo) {
+
+  dim3 threads(32,32);
+  int32_t total_rows=0, total_cols=0;
+  
+  BatchedMatrixCopyDesc<double> batch_desc; 
+  const int32_t MAX_BATCH_SIZE=batch_desc.MAX_BATCH_SIZE;
+
+  int i;
+  for (i = 0; i < num_mats; i++) {
+    int b = i%MAX_BATCH_SIZE;
+    
+    // fill in desc
+    MatrixCopyDesc<double> &desc = batch_desc.batch[b];
+    desc.num_rows = num_rows[i];
+    desc.num_cols = num_cols[i];
+    desc.input = inputs[i];
+    desc.output = outputs[i];
+    desc.ldi = ldi[i];
+    desc.ldo = ldo[i];
+
+    total_rows+=desc.num_rows;
+    total_cols+=desc.num_cols;
+
+    if (b==MAX_BATCH_SIZE-1) {
+      // compute average number of rows/cols across batch
+      int32_t rows = ceilf(total_rows / (float)MAX_BATCH_SIZE);
+      int32_t cols = ceilf(total_cols / (float)MAX_BATCH_SIZE);
+      dim3 blocks((cols + 31) / 32,
+                  (rows + 31) / 32, 
+                  MAX_BATCH_SIZE);
+
+      // no memcpy needed here.  Memory will be passed down directly
+      // through paramter passing and live in constant memory
+      
+      // launch batch
+       _cuda_batch_copy_mats<<<blocks,threads>>>(batch_desc);
+
+       // reset total counters
+       total_rows=0;
+       total_cols=0;
+    }
+  }
+
+  int32_t remaining = i%MAX_BATCH_SIZE;
+
+  if (remaining > 0) {
+      // compute average number of rows/cols across batch
+      int32_t rows = ceilf(total_rows / (float)remaining);
+      int32_t cols = ceilf(total_cols / (float)remaining);
+
+      dim3 blocks((cols + 31) / 32,
+                  (rows + 31) / 32, 
+                  remaining);
+      
+      // no memcpy needed here.  Memory will be passed down directly
+      // through paramter passing and live in constant memory
+
+      // launch batch
+       _cuda_batch_copy_mats<<<blocks,threads>>>(batch_desc);
+  }
 }

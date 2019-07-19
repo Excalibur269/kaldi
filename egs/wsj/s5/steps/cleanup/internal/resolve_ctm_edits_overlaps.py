@@ -7,7 +7,7 @@
 
 """
 Script to combine ctms edits with overlapping segments obtained from
-smith-waterman alignment. This script is similar to resolve_ctm_edits.py,
+smith-waterman alignment. This script is similar to utils/ctm/resolve_ctm_edits.py,
 where the overlapping region is just split in two. The approach here is a
 little more advanced since we have access to the WER
 (w.r.t. the reference text). It finds the WER of the overlapped region
@@ -15,6 +15,7 @@ in the two overlapping segments, and chooses the better one.
 """
 
 from __future__ import print_function
+from __future__ import division
 import argparse
 import collections
 import logging
@@ -135,7 +136,7 @@ def wer(ctm_edit_lines):
         return float('inf')
     if num_words == 0 and num_incorrect_words == 0:
         return 0
-    return (float(num_incorrect_words) / num_words, -num_words)
+    return float(num_incorrect_words) / num_words
 
 
 def choose_best_ctm_lines(first_lines, second_lines,
@@ -143,9 +144,9 @@ def choose_best_ctm_lines(first_lines, second_lines,
     """Returns ctm lines that have lower WER. If the WER is the lines with
     the higher number of words is returned.
     """
-    i, best_lines = min((0, first_lines), (1, second_lines),
+    i, best_lines = min((0, first_lines),
+                        (1, second_lines),
                         key=lambda x: wer(x[1]))
-
     return i
 
 
@@ -155,8 +156,8 @@ def resolve_overlaps(ctm_edits, segments):
     Returns new lines of CTM for the recording.
 
     Arguments:
-        ctms - The CTM lines for a single recording. This is one value stored
-            in the dictionary read by read_ctm(). Assumes that the lines
+        ctm_edits - The CTM lines for a single recording. This is one value
+            stored in the dictionary read by read_ctm(). Assumes that the lines
             are sorted by the utterance-ids.
             The format is the following:
             [[(utteranceA, channelA, start_time1, duration1, hyp_word1, conf1),
@@ -171,13 +172,12 @@ def resolve_overlaps(ctm_edits, segments):
              [...
               (utteranceZ, channelZ, start_timeN, durationN, hyp_wordN, confN)]
             ]
+            Expects this to be non-empty.
         segments - Dictionary containing the output of read_segments()
             { utterance_id: (recording_id, start_time, end_time) }
         """
     total_ctm_edits = []
-    if len(ctm_edits) == 0:
-        raise RuntimeError('CTMs for recording is empty. '
-                           'Something wrong with the input ctms')
+    assert len(ctm_edits) > 0
 
     # First column of first line in CTM for first utterance
     next_utt = ctm_edits[0][0][0]
@@ -300,12 +300,17 @@ def run(args):
     segments, reco2utt = read_segments(args.segments)
     ctm_edits = read_ctm_edits(args.ctm_edits_in, segments)
 
-    for reco, utts in reco2utt.iteritems():
+    for reco, utts in reco2utt.items():
         ctm_edits_for_reco = []
         for utt in sorted(utts, key=lambda x: segments[x][1]):
             if (reco, utt) in ctm_edits:
                 ctm_edits_for_reco.append(ctm_edits[(reco, utt)])
         try:
+            if len(ctm_edits_for_reco) == 0:
+                logger.warn('CTMs for recording %s is empty.',
+                            reco)
+                continue   # Go to the next recording
+
             # Process CTMs in the recordings
             ctm_edits_for_reco = resolve_overlaps(ctm_edits_for_reco, segments)
             write_ctm_edits(ctm_edits_for_reco, args.ctm_edits_out)

@@ -21,7 +21,7 @@ if ! $(python -c "import distutils.sysconfig" &> /dev/null); then
     echo "Proceeding with installation." >&2
 else
   # get include path for this python version
-  INCLUDE_PY=$(python -c "from distutils import sysconfig as s; print s.get_config_vars()['INCLUDEPY']")
+  INCLUDE_PY=$(python -c "from distutils import sysconfig as s; print(s.get_python_inc())")
   if [ ! -f "${INCLUDE_PY}/Python.h" ]; then
       echo "$0 : ERROR: python-devel/python-dev not installed" >&2
       if which yum >&/dev/null; then
@@ -60,7 +60,6 @@ fi
     cd phonetisaurus-g2p
     #checkout the current kaldi tag
     git checkout -b kaldi kaldi
-    cd src
     ./configure --with-openfst-includes=${TOOLS}/openfst/include --with-openfst-libs=${TOOLS}/openfst/lib
     make
 )
@@ -80,7 +79,7 @@ fi
   wd=`readlink -f $wd || pwd`
 
   echo "export PHONETISAURUS=\"$wd/phonetisaurus-g2p\""
-  echo "export PATH=\"\$PATH:\${PHONETISAURUS}/src/bin\""
+  echo "export PATH=\"\$PATH:\${PHONETISAURUS}:\${PHONETISAURUS}/src/scripts\""
 ) >> env.sh
 
 echo >&2 "Installation of PHONETISAURUS finished successfully"

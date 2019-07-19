@@ -7,6 +7,7 @@
 # that contains some subset of the following files:
 #  feats.scp
 #  wav.scp
+#  vad.scp
 #  spk2utt
 #  utt2spk
 #  text
@@ -79,6 +80,9 @@ if [ -f $srcdir/feats.scp ]; then
   utils/apply_map.pl -f 1 $destdir/utt_map <$srcdir/feats.scp >$destdir/feats.scp
 fi
 
+if [ -f $srcdir/vad.scp ]; then
+  utils/apply_map.pl -f 1 $destdir/utt_map <$srcdir/vad.scp >$destdir/vad.scp
+fi
 
 if [ -f $srcdir/segments ]; then
   utils/apply_map.pl -f 1 $destdir/utt_map <$srcdir/segments >$destdir/segments
@@ -99,13 +103,23 @@ fi
 if [ -f $srcdir/utt2dur ]; then
   utils/apply_map.pl -f 1 $destdir/utt_map <$srcdir/utt2dur >$destdir/utt2dur
 fi
+if [ -f $srcdir/utt2num_frames ]; then
+  utils/apply_map.pl -f 1 $destdir/utt_map <$srcdir/utt2num_frames >$destdir/utt2num_frames
+fi
+if [ -f $srcdir/reco2dur ]; then
+  if [ -f $srcdir/segments ]; then
+    cp $srcdir/reco2dur $destdir/reco2dur
+  else
+    utils/apply_map.pl -f 1 $destdir/utt_map <$srcdir/reco2dur >$destdir/reco2dur
+  fi
+fi
 if [ -f $srcdir/spk2gender ]; then
   utils/apply_map.pl -f 1 $destdir/spk_map <$srcdir/spk2gender >$destdir/spk2gender
 fi
 if [ -f $srcdir/cmvn.scp ]; then
   utils/apply_map.pl -f 1 $destdir/spk_map <$srcdir/cmvn.scp >$destdir/cmvn.scp
 fi
-for f in stm glm ctm; do
+for f in frame_shift stm glm ctm; do
   if [ -f $srcdir/$f ]; then
     cp $srcdir/$f $destdir
   fi
@@ -115,7 +129,7 @@ rm $destdir/spk_map $destdir/utt_map
 
 echo "$0: copied data from $srcdir to $destdir"
 
-for f in feats.scp cmvn.scp vad.scp utt2lang utt2uniq utt2dur utt2num_frames text wav.scp reco2file_and_channel stm glm ctm; do
+for f in feats.scp cmvn.scp vad.scp utt2lang utt2uniq utt2dur utt2num_frames text wav.scp reco2file_and_channel frame_shift stm glm ctm; do
   if [ -f $destdir/$f ] && [ ! -f $srcdir/$f ]; then
     echo "$0: file $f exists in dest $destdir but not in src $srcdir.  Moving it to"
     echo " ... $destdir/.backup/$f"

@@ -16,6 +16,12 @@ gmm=tri4b                # This specifies a GMM-dir from the features of the typ
                          # it should contain alignments for 'train_set'.
 
 num_threads_ubm=32
+
+nj_extractor=10
+# It runs a JOB with '-pe smp N', where N=$[threads*processes]
+num_processes_extractor=4
+num_threads_extractor=4
+
 nnet3_affix=             # affix for exp/nnet3 directory to put iVector stuff in (e.g.
                          # in the tedlium recip it's _cleaned).
 
@@ -57,7 +63,7 @@ if [ $stage -le 2 ]; then
   # them overwrite each other.
   mfccdir=data/${train_set}_sp_hires/data
   if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d $mfccdir/storage ]; then
-    utils/create_split_dir.pl /export/b0{5,6,7,8}/$USER/kaldi-data/egs/wsj-$(date +'%m_%d_%H_%M')/s5/$mfccdir/storage $mfccdir/storage
+    utils/create_split_dir.pl /export/b0{5,6,7,8}/$USER/kaldi-data/mfcc/wsj-$(date +'%m_%d_%H_%M')/s5/$mfccdir/storage $mfccdir/storage
   fi
 
   for datadir in ${train_set}_sp ${test_sets}; do
@@ -110,7 +116,8 @@ if [ $stage -le 4 ]; then
   # can be sensitive to the amount of data.  The script defaults to an iVector dimension of
   # 100.
   echo "$0: training the iVector extractor"
-  steps/online/nnet2/train_ivector_extractor.sh --cmd "$train_cmd" --nj 10 \
+  steps/online/nnet2/train_ivector_extractor.sh --cmd "$train_cmd" \
+    --nj $nj_extractor --num-threads $num_threads_extractor --num-processes $num_processes_extractor \
     data/${train_set}_sp_hires exp/nnet3${nnet3_affix}/diag_ubm exp/nnet3${nnet3_affix}/extractor || exit 1;
 fi
 
@@ -120,7 +127,7 @@ if [ $stage -le 5 ]; then
   # valid for the non-'max2' data; the utterance list is the same.
   ivectordir=exp/nnet3${nnet3_affix}/ivectors_${train_set}_sp_hires
   if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d $ivectordir/storage ]; then
-    utils/create_split_dir.pl /export/b0{5,6,7,8}/$USER/kaldi-data/egs/wsj-$(date +'%m_%d_%H_%M')/s5/$ivectordir/storage $ivectordir/storage
+    utils/create_split_dir.pl /export/b0{5,6,7,8}/$USER/kaldi-data/ivectors/wsj-$(date +'%m_%d_%H_%M')/s5/$ivectordir/storage $ivectordir/storage
   fi
 
   # We now extract iVectors on the speed-perturbed training data .  With
@@ -149,8 +156,8 @@ if [ $stage -le 5 ]; then
   done
 fi
 
-if [ -f data/${train_set}_sp/feats.scp ] && [ $stage -le 8 ]; then
-  echo "$0: $feats already exists.  Refusing to overwrite the features "
+if [ -f data/${train_set}_sp/feats.scp ] && [ $stage -le 7 ]; then
+  echo "$0: data/${train_set}_sp/feats.scp already exists.  Refusing to overwrite the features "
   echo " to avoid wasting time.  Please remove the file and continue if you really mean this."
   exit 1;
 fi

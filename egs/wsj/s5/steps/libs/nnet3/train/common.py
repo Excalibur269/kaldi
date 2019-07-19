@@ -7,6 +7,7 @@
 """This module contains classes and methods common to training of
 nnet3 neural networks.
 """
+from __future__ import division
 
 import argparse
 import glob
@@ -17,8 +18,7 @@ import re
 import shutil
 
 import libs.common as common_lib
-import libs.nnet3.train.dropout_schedule as dropout_schedule
-from dropout_schedule import *
+from libs.nnet3.train.dropout_schedule import *
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -35,6 +35,7 @@ class RunOpts(object):
     def __init__(self):
         self.command = None
         self.train_queue_opt = None
+        self.combine_gpu_opt = None
         self.combine_queue_opt = None
         self.prior_gpu_opt = None
         self.prior_queue_opt = None
@@ -69,9 +70,12 @@ def get_multitask_egs_opts(egs_dir, egs_prefix="",
         '--output=ark:foo/egs/output.3.ark --weight=ark:foo/egs/weights.3.ark'
         i.e. egs_prefix is "" for train and
         "valid_diagnostic." for validation.
+
+        Caution: archive_index is usually an integer, but may be a string ("JOB")
+        in some cases.
     """
     multitask_egs_opts = ""
-    egs_suffix = ".{0}".format(archive_index) if archive_index > -1 else ""
+    egs_suffix = ".{0}".format(archive_index) if archive_index != -1 else ""
 
     if use_multitask_egs:
         output_file_name = ("{egs_dir}/{egs_prefix}output{egs_suffix}.ark"
@@ -195,7 +199,7 @@ def validate_chunk_width(chunk_width):
     for elem in a:
         try:
             i = int(elem)
-            if i < 1:
+            if i < 1 and i != -1:
                 return False
         except:
             return False
@@ -265,8 +269,7 @@ def validate_minibatch_size_str(minibatch_size_str):
                 return False
         # check that the thing before the '=' sign is a positive integer
         try:
-            i = b[0]
-            if i <= 0:
+            if int(b[0]) <= 0:
                 return False
         except:
             return False  # not an integer at all.
@@ -288,7 +291,7 @@ def halve_range_str(range_str):
     halved_ranges = []
     for r in ranges:
         # a range may be either e.g. '64', or '128:256'
-        c = [str(max(1, int(x)/2)) for x in r.split(":")]
+        c = [str(max(1, int(x)//2)) for x in r.split(":")]
         halved_ranges.append(":".join(c))
     return ','.join(halved_ranges)
 
@@ -320,7 +323,7 @@ def copy_egs_properties_to_exp_dir(egs_dir, dir):
         for file in ['cmvn_opts', 'splice_opts', 'info/final.ie.id', 'final.mat']:
             file_name = '{dir}/{file}'.format(dir=egs_dir, file=file)
             if os.path.isfile(file_name):
-                shutil.copy2(file_name, dir)
+                shutil.copy(file_name, dir)
     except IOError:
         logger.error("Error while trying to copy egs "
                      "property files to {dir}".format(dir=dir))
@@ -357,6 +360,36 @@ def parse_generic_config_vars_file(var_file):
     raise Exception('Error while parsing the file {0}'.format(var_file))
 
 
+def get_input_model_info(input_model):
+    """ This function returns a dictionary with keys "model_left_context" and
+        "model_right_context" and values equal to the left/right model contexts
+        for input_model.
+        This function is useful when using the --trainer.input-model option
+        instead of initializing the model using configs.
+    """
+    variables = {}
+    try:
+        out = common_lib.get_command_stdout("""nnet3-info {0} | """
+                                            """head -4 """.format(input_model))
+        # out looks like this
+        # left-context: 7
+        # right-context: 0
+        # num-parameters: 90543902
+        # modulus: 1
+        for line in out.split("\n"):
+            parts = line.split(":")
+            if len(parts) != 2:
+                continue
+            if parts[0].strip() ==  'left-context':
+                variables['model_left_context'] = int(parts[1].strip())
+            elif parts[0].strip() ==  'right-context':
+                variables['model_right_context'] = int(parts[1].strip())
+
+    except ValueError:
+        pass
+    return variables
+
+
 def verify_egs_dir(egs_dir, feat_dim, ivector_dim, ivector_extractor_id,
                    left_context, right_context,
                    left_context_initial=-1, right_context_final=-1):
@@ -368,6 +401,8 @@ def verify_egs_dir(egs_dir, feat_dim, ivector_dim, ivector_extractor_id,
         try:
             egs_ivector_id = open('{0}/info/final.ie.id'.format(
                                         egs_dir)).readline().strip()
+            if (egs_ivector_id == ""):
+                egs_ivector_id = None;
         except:
             # it could actually happen that the file is not there
             # for example in cases where the egs were dumped by
@@ -403,10 +438,12 @@ def verify_egs_dir(egs_dir, feat_dim, ivector_dim, ivector_extractor_id,
 
         if (((egs_ivector_id is None) and (ivector_extractor_id is not None)) or
             ((egs_ivector_id is not None) and (ivector_extractor_id is None))):
-            logger.warning("The ivector ids are inconsistently used. It's your "
+            logger.warning("The ivector ids are used inconsistently. It's your "
                           "responsibility to make sure the ivector extractor "
                           "has been used consistently")
-        elif ((egs_ivector_id is None) and (ivector_extractor_id is None)):
+            logger.warning("ivector id for egs: {0} in dir {1}".format(egs_ivector_id, egs_dir))
+            logger.warning("ivector id for extractor: {0}".format(ivector_extractor_id))
+        elif ((egs_ivector_dim > 0) and (egs_ivector_id is None) and (ivector_extractor_id is None)):
             logger.warning("The ivector ids are not used. It's your "
                           "responsibility to make sure the ivector extractor "
                           "has been used consistently")
@@ -491,17 +528,20 @@ def smooth_presoftmax_prior_scale_vector(pdf_counts,
                                          presoftmax_prior_scale_power=-0.25,
                                          smooth=0.01):
     total = sum(pdf_counts)
-    average_count = total/len(pdf_counts)
+    average_count = float(total) / len(pdf_counts)
     scales = []
     for i in range(len(pdf_counts)):
         scales.append(math.pow(pdf_counts[i] + smooth * average_count,
                                presoftmax_prior_scale_power))
     num_pdfs = len(pdf_counts)
-    scaled_counts = map(lambda x: x * float(num_pdfs) / sum(scales), scales)
+    scaled_counts = [x * float(num_pdfs) / sum(scales) for x in scales]
     return scaled_counts
 
 
-def prepare_initial_network(dir, run_opts, srand=-3):
+def prepare_initial_network(dir, run_opts, srand=-3, input_model=None):
+    if input_model is not None:
+        shutil.copy(input_model, "{0}/0.raw".format(dir))
+        return
     if os.path.exists(dir+"/configs/init.config"):
         common_lib.execute_command(
             """{command} {dir}/log/add_first_layer.log \
@@ -524,7 +564,7 @@ def get_model_combine_iters(num_iters, num_epochs,
         in the final model-averaging phase.  (note: it's a weighted average
         where the weights are worked out from a subset of training data.)"""
 
-    approx_iters_per_epoch_final = num_archives/num_jobs_final
+    approx_iters_per_epoch_final = float(num_archives) / num_jobs_final
     # Note: it used to be that we would combine over an entire epoch,
     # but in practice we very rarely would use any weights from towards
     # the end of that range, so we are changing it to use not
@@ -541,8 +581,8 @@ def get_model_combine_iters(num_iters, num_epochs,
     # But if this value is > max_models_combine, then the models
     # are subsampled to get these many models to combine.
 
-    num_iters_combine_initial = min(approx_iters_per_epoch_final/2 + 1,
-                                    num_iters/2)
+    num_iters_combine_initial = min(int(approx_iters_per_epoch_final/2) + 1,
+                                    int(num_iters/2))
 
     if num_iters_combine_initial > max_models_combine:
         subsample_model_factor = int(
@@ -554,11 +594,21 @@ def get_model_combine_iters(num_iters, num_epochs,
         models_to_combine.add(num_iters)
     else:
         subsample_model_factor = 1
-        num_iters_combine = min(max_models_combine, num_iters/2)
+        num_iters_combine = min(max_models_combine, num_iters//2)
         models_to_combine = set(range(num_iters - num_iters_combine + 1,
                                       num_iters + 1))
 
     return models_to_combine
+
+
+def get_current_num_jobs(it, num_it, start, step, end):
+    "Get number of jobs for iteration number 'it' of range('num_it')"
+
+    ideal = float(start) + (end - start) * float(it) / num_it
+    if ideal < step:
+        return int(0.5 + ideal)
+    else:
+        return int(0.5 + ideal / step) * step
 
 
 def get_learning_rate(iter, num_jobs, num_iters, num_archives_processed,
@@ -570,8 +620,7 @@ def get_learning_rate(iter, num_jobs, num_iters, num_archives_processed,
         effective_learning_rate = (
                 initial_effective_lrate
                 * math.exp(num_archives_processed
-                           * math.log(final_effective_lrate
-                                      / initial_effective_lrate)
+                           * math.log(float(final_effective_lrate) / initial_effective_lrate)
                            / num_archives_to_process))
 
     return num_jobs * effective_learning_rate
@@ -642,13 +691,11 @@ def remove_model(nnet_dir, iter, num_iters, models_to_combine=None,
         os.remove(file_name)
 
 
-def self_test():
-    assert halve_minibatch_size_str('64') == '32'
-    assert halve_minibatch_size_str('64,16:32') == '32,8:16'
-    assert halve_minibatch_size_str('1') == '1'
-    assert halve_minibatch_size_str('128=64/256=40,80:100') == '128=32/256=20,40:50'
-    assert validate_chunk_width('64')
-    assert validate_chunk_width('64,25,128')
+def positive_int(arg):
+   val = int(arg)
+   if (val <= 0):
+      raise argparse.ArgumentTypeError("must be positive int: '%s'" % arg)
+   return val
 
 
 class CommonParser(object):
@@ -710,11 +757,6 @@ class CommonParser(object):
                                  to the right of the *last* input chunk extracted
                                  from an utterance.  If negative, defaults to the
                                  same as --egs.chunk-right-context""")
-        self.parser.add_argument("--egs.transform_dir", type=str,
-                                 dest='transform_dir', default=None,
-                                 action=common_lib.NullstrToNoneAction,
-                                 help="String to provide options directly to "
-                                 "steps/nnet3/get_egs.sh script")
         self.parser.add_argument("--egs.dir", type=str, dest='egs_dir',
                                  default=None,
                                  action=common_lib.NullstrToNoneAction,
@@ -810,6 +852,10 @@ class CommonParser(object):
                                  type=int, dest='num_jobs_final', default=8,
                                  help="Number of neural net jobs to run in "
                                  "parallel at the end of training")
+        self.parser.add_argument("--trainer.optimization.num-jobs-step",
+            type=positive_int,  metavar='N', dest='num_jobs_step', default=1,
+            help="""Number of jobs increment, when exceeds this number. For
+            example, if N=3, the number of jobs may progress as 1, 2, 3, 6, 9...""")
         self.parser.add_argument("--trainer.optimization.max-models-combine",
                                  "--trainer.max-models-combine",
                                  type=int, dest='max_models_combine',
@@ -818,6 +864,16 @@ class CommonParser(object):
                                  the final model combination stage.  These
                                  models will themselves be averages of
                                  iteration-number ranges""")
+        self.parser.add_argument("--trainer.optimization.max-objective-evaluations",
+                                 "--trainer.max-objective-evaluations",
+                                 type=int, dest='max_objective_evaluations',
+                                 default=30,
+                                 help="""The maximum number of objective
+                                 evaluations in order to figure out the
+                                 best number of models to combine. It helps to
+                                 speedup if the number of models provided to the
+                                 model combination binary is quite large (e.g.
+                                 several hundred).""")
         self.parser.add_argument("--trainer.optimization.do-final-combination",
                                  dest='do_final_combination', type=str,
                                  action=common_lib.StrToBoolAction,
@@ -827,9 +883,7 @@ class CommonParser(object):
                                  last-numbered model as the final.mdl).""")
         self.parser.add_argument("--trainer.optimization.combine-sum-to-one-penalty",
                                  type=float, dest='combine_sum_to_one_penalty', default=0.0,
-                                 help="""If > 0, activates 'soft' enforcement of the
-                                 sum-to-one penalty in combination (may be helpful
-                                 if using dropout).  E.g. 1.0e-03.""")
+                                 help="""This option is deprecated and does nothing.""")
         self.parser.add_argument("--trainer.optimization.momentum", type=float,
                                  dest='momentum', default=0.0,
                                  help="""Momentum used in update computation.
@@ -861,6 +915,11 @@ class CommonParser(object):
                                  lstm*=0,0.2,0'.  More general should precede
                                  less general patterns, as they are applied
                                  sequentially.""")
+        self.parser.add_argument("--trainer.add-option", type=str,
+                                 dest='train_opts', action='append', default=[],
+                                 help="""You can use this to add arbitrary options that
+                                 will be passed through to the core training code (nnet3-train
+                                 or nnet3-chain-train)""")
         self.parser.add_argument("--trainer.optimization.backstitch-training-scale",
                                  type=float, dest='backstitch_training_scale',
                                  default=0.0, help="""scale of parameters changes
@@ -892,12 +951,12 @@ class CommonParser(object):
                                  """, default="queue.pl")
         self.parser.add_argument("--egs.cmd", type=str, dest="egs_command",
                                  action=common_lib.NullstrToNoneAction,
-                                 default="queue.pl",
                                  help="Script to launch egs jobs")
         self.parser.add_argument("--use-gpu", type=str,
-                                 action=common_lib.StrToBoolAction,
-                                 choices=["true", "false"],
-                                 help="Use GPU for training", default=True)
+                                 choices=["true", "false", "yes", "no", "wait"],
+                                 help="Use GPU for training. "
+                                 "Note 'true' and 'false' are deprecated.",
+                                 default="yes")
         self.parser.add_argument("--cleanup", type=str,
                                  action=common_lib.StrToBoolAction,
                                  choices=["true", "false"], default=True,
@@ -935,5 +994,43 @@ class CommonParser(object):
                                  then only failure notifications are sent""")
 
 
+import unittest
+
+class SelfTest(unittest.TestCase):
+
+    def test_halve_minibatch_size_str(self):
+        self.assertEqual('32', halve_minibatch_size_str('64'))
+        self.assertEqual('32,8:16', halve_minibatch_size_str('64,16:32'))
+        self.assertEqual('1', halve_minibatch_size_str('1'))
+        self.assertEqual('128=32/256=20,40:50', halve_minibatch_size_str('128=64/256=40,80:100'))
+
+
+    def test_validate_chunk_width(self):
+        for s in [ '64', '64,25,128' ]:
+            self.assertTrue(validate_chunk_width(s), s)
+
+
+    def test_validate_minibatch_size_str(self):
+        # Good descriptors.
+        for s in [ '32', '32,64', '1:32', '1:32,64', '64,1:32', '1:5,10:15',
+                   '128=64:128/256=32,64', '1=2/3=4', '1=1/2=2/3=3/4=4' ]:
+            self.assertTrue(validate_minibatch_size_str(s), s)
+        # Bad descriptors.
+        for s in [ None, 42, (43,), '', '1:', ':2', '3,', ',4', '5:6,', ',7:8',
+                   '9=', '10=10/', '11=11/11', '12=1:2//13=1:3' '14=/15=15',
+                   '16/17=17', '/18=18', '/18', '//19', '/' ]:
+            self.assertFalse(validate_minibatch_size_str(s), s)
+
+
+    def test_get_current_num_jobs(self):
+        niters = 12
+        self.assertEqual([2, 3, 3, 4, 4, 5, 6, 6, 7, 7, 8, 8],
+                         [get_current_num_jobs(i, niters, 2, 1, 9)
+                              for i in range(niters)])
+        self.assertEqual([2, 3, 3, 3, 3, 6, 6, 6, 6, 6, 9, 9],
+                         [get_current_num_jobs(i, niters, 2, 3, 9)
+                              for i in range(niters)])
+
+
 if __name__ == '__main__':
-    _self_test()
+    unittest.main()

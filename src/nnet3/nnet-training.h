@@ -26,6 +26,7 @@
 #include "nnet3/nnet-compute.h"
 #include "nnet3/nnet-optimize.h"
 #include "nnet3/nnet-example-utils.h"
+#include "nnet3/nnet-utils.h"
 
 namespace kaldi {
 namespace nnet3 {
@@ -36,8 +37,10 @@ struct NnetTrainerOptions {
   int32 print_interval;
   bool debug_computation;
   BaseFloat momentum;
+  BaseFloat l2_regularize_factor;
   BaseFloat backstitch_training_scale;
   int32 backstitch_training_interval;
+  BaseFloat batchnorm_stats_scale;
   std::string read_cache;
   std::string write_cache;
   bool binary_write_cache;
@@ -51,8 +54,10 @@ struct NnetTrainerOptions {
       print_interval(100),
       debug_computation(false),
       momentum(0.0),
+      l2_regularize_factor(1.0),
       backstitch_training_scale(0.0),
       backstitch_training_interval(1),
+      batchnorm_stats_scale(0.8),
       binary_write_cache(true),
       max_param_change(2.0) { }
   void Register(OptionsItf *opts) {
@@ -68,12 +73,24 @@ struct NnetTrainerOptions {
     opts->Register("max-param-change", &max_param_change, "The maximum change in "
                    "parameters allowed per minibatch, measured in Euclidean norm "
                    "over the entire model (change will be clipped to this value)");
-    opts->Register("momentum", &momentum, "momentum constant to apply during "
+    opts->Register("momentum", &momentum, "Momentum constant to apply during "
                    "training (help stabilize update).  e.g. 0.9.  Note: we "
                    "automatically multiply the learning rate by (1-momenum) "
                    "so that the 'effective' learning rate is the same as "
                    "before (because momentum would normally increase the "
                    "effective learning rate by 1/(1-momentum))");
+    opts->Register("l2-regularize-factor", &l2_regularize_factor, "Factor that "
+                   "affects the strength of l2 regularization on model "
+                   "parameters.  The primary way to specify this type of "
+                   "l2 regularization is via the 'l2-regularize'"
+                   "configuration value at the config-file level. "
+                   " --l2-regularize-factor will be multiplied by the component-level "
+                   "l2-regularize values and can be used to correct for effects "
+                   "related to parallelization by model averaging.");
+    opts->Register("batchnorm-stats-scale", &batchnorm_stats_scale,
+                   "Factor by which we scale down the accumulated stats of batchnorm "
+                   "layers after processing each minibatch.  Ensure that the final "
+                   "model we write out has batchnorm stats that are fairly fresh.");
     opts->Register("backstitch-training-scale", &backstitch_training_scale,
                    "backstitch training factor. "
                    "if 0 then in the normal training mode. It is referred as "
@@ -82,10 +99,10 @@ struct NnetTrainerOptions {
                    &backstitch_training_interval,
                    "do backstitch training with the specified interval of "
                    "minibatches. It is referred as 'n' in our publications.");
-    opts->Register("read-cache", &read_cache, "the location where we can read "
-                   "the cached computation from");
-    opts->Register("write-cache", &write_cache, "the location where we want to "
-                   "write the cached computation to");
+    opts->Register("read-cache", &read_cache, "The location from which to read "
+                   "the cached computation.");
+    opts->Register("write-cache", &write_cache, "The location to which to write "
+                   "the cached computation.");
     opts->Register("binary-write-cache", &binary_write_cache, "Write "
                    "computation cache in binary mode");
 
@@ -171,10 +188,6 @@ class NnetTrainer {
   // Prints out the final stats, and return true if there was a nonzero count.
   bool PrintTotalStats() const;
 
-  // Prints out the max-change stats (if nonzero): the percentage of time that
-  // per-component max-change and global max-change were enforced.
-  void PrintMaxChangeStats() const;
-
   ~NnetTrainer();
  private:
   // The internal function for doing one step of conventional SGD training.
@@ -193,11 +206,9 @@ class NnetTrainer {
 
   const NnetTrainerOptions config_;
   Nnet *nnet_;
-  Nnet *delta_nnet_;  // Only used if momentum != 0.0 or max-param-change !=
-                      // 0.0.  nnet representing accumulated parameter-change
-                      // (we'd call this gradient_nnet_, but due to
-                      // natural-gradient update, it's better to consider it as
-                      // a delta-parameter nnet.
+  Nnet *delta_nnet_;  // nnet representing parameter-change for this minibatch
+                      // (or, when using momentum, the moving weighted average
+                      // of this).
   CachingOptimizingCompiler compiler_;
 
   // This code supports multiple output layers, even though in the
@@ -206,8 +217,7 @@ class NnetTrainer {
   int32 num_minibatches_processed_;
 
   // stats for max-change.
-  std::vector<int32> num_max_change_per_component_applied_;
-  int32 num_max_change_global_applied_;
+  MaxChangeStats max_change_stats_;
 
   unordered_map<std::string, ObjectiveFunctionInfo, StringHasher> objf_info_;
 
