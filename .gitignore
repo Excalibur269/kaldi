@@ -80,6 +80,8 @@ GSYMS
 /egs/*/s*/fbank
 /egs/*/s*/fbank*
 /egs/*/s*/kaldi_files
+/egs/sogou/
+/egs/swbd/s5c/local/chain/sogou_tuning/
 
 # /tools/
 /tools/pocolm/
