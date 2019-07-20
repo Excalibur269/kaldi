@@ -76,6 +76,7 @@ config_to_layer = {
         'fast-norm-pgru-layer' : xlayers.XconfigFastNormPgruLayer,
         'fast-opgru-layer' : xlayers.XconfigFastOpgruLayer,
         'fast-norm-opgru-layer' : xlayers.XconfigFastNormOpgruLayer,
+        'fast-norm-opgrur-layer' : xlayers.XconfigFastNormOpgrurLayer,
         'mgru-layer' : xlayers.XconfigMgruLayer,
         'mgruip-layer' : xlayers.XconfigMgruipLayer,
         'tdnnf-layer': xlayers.XconfigTdnnfLayer,
