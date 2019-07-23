@@ -187,6 +187,8 @@ Component* Component::NewComponentOfType(const std::string &component_type) {
     ans = new GruNonlinearityComponent();
   } else if (component_type == "OutputGruNonlinearityComponent") {
     ans = new OutputGruNonlinearityComponent();
+  } else if (component_type == "MgruInputProjectionNonlinearityComponent") {
+    ans = new MgruInputProjectionNonlinearityComponent();
   } else if (component_type == "ScaleAndOffsetComponent") {
     ans = new ScaleAndOffsetComponent();
   }

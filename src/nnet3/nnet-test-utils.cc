@@ -1773,6 +1773,12 @@ static void GenerateRandomComponentConfig(std::string *component_type,
 
       break;
     }
+    case 38: {
+      *component_type = "MgruInputProjectionNonlinearityComponent";
+      os << "cell-dim=" << RandInt(10, 20);
+
+      break;
+    }
     default:
       KALDI_ERR << "Error generating random component";
   }

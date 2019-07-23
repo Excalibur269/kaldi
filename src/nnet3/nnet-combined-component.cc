@@ -1614,7 +1614,7 @@ void GruNonlinearityComponent::TanhStatsAndSelfRepair(
   // For the next few lines, compare with TanhComponent::StoreStats(), which is where
   // we got this code.
   // tanh_deriv is the function derivative of the tanh function,
-  // tanh'(x) = tanh(x) * (1.0 - tanh(x)).  h_t corresponds to tanh(x).
+  // tanh'(x) = 1.0 - tanh^2(x).  h_t corresponds to tanh(x).
   CuMatrix<BaseFloat> tanh_deriv(h_t);
   tanh_deriv.ApplyPow(2.0);
   tanh_deriv.Scale(-1.0);
@@ -2098,7 +2098,7 @@ void OutputGruNonlinearityComponent::TanhStatsAndSelfRepair(
   // For the next few lines, compare with TanhComponent::StoreStats(), which is where
   // we got this code.
   // tanh_deriv is the function derivative of the tanh function,
-  // tanh'(x) = tanh(x) * (1.0 - tanh(x)).  h_t corresponds to tanh(x).
+  // tanh'(x) = 1 - tanh^2(x).  h_t corresponds to tanh(x).
   CuMatrix<BaseFloat> tanh_deriv(h_t);
   tanh_deriv.ApplyPow(2.0);
   tanh_deriv.Scale(-1.0);
@@ -2325,6 +2325,178 @@ OutputGruNonlinearityComponent::OutputGruNonlinearityComponent(
     self_repair_threshold_(other.self_repair_threshold_),
     self_repair_scale_(other.self_repair_scale_),
     preconditioner_(other.preconditioner_) {
+  Check();
+}
+
+int32 MgruInputProjectionNonlinearityComponent::InputDim() const {
+  return 3 * cell_dim_;
+}
+
+int32 MgruInputProjectionNonlinearityComponent::OutputDim() const {
+  return 2 * cell_dim_;
+}
+
+
+std::string MgruInputProjectionNonlinearityComponent::Info() const {
+  std::ostringstream stream;
+  stream << Type() << ", dim=" << cell_dim_;
+  return stream.str();
+}
+
+void MgruInputProjectionNonlinearityComponent::InitFromConfig(ConfigLine *cfl) {
+  cell_dim_ = -1;
+
+  if (!cfl->GetValue("cell-dim", &cell_dim_) || cell_dim_ <= 0)
+    KALDI_ERR << "cell-dim > 0 is required for GruNonlinearityComponent.";
+
+  Check();
+}
+
+void* MgruInputProjectionNonlinearityComponent::Propagate(
+    const ComponentPrecomputedIndexes *indexes,
+    const CuMatrixBase<BaseFloat> &in,
+    CuMatrixBase<BaseFloat> *out) const {
+  KALDI_ASSERT(in.NumRows() == out->NumRows() &&
+               in.NumCols() == InputDim() &&
+               out->NumCols() == OutputDim());
+  // This component implements the function
+  // (z_t, hpart_t, c_{t-1}) -> (h_t, c_t)
+  // of dimensions
+  // (cell_dim, cell_dim, cell_dim) -> (cell_dim, cell_dim),
+  // where:
+  // h_t = \relu(hpart_t)
+  // c_t = ( 1 - z_t ) \dot h_t + z_t \dot c_{t-1}.
+  int32 num_rows = in.NumRows(),
+      c = cell_dim_;
+  CuSubMatrix<BaseFloat> z_t(in, 0, num_rows, 0, c),
+      hpart_t(in, 0, num_rows, c, c),
+      c_t1(in, 0, num_rows, c + c, c);
+
+  CuSubMatrix<BaseFloat> h_t(*out, 0, num_rows, 0, c),
+      c_t(*out, 0, num_rows, c, c);
+
+  // Apply rectified linear function (x >= 0 ? x : 0.0)
+  h_t.CopyFromMat(hpart_t);
+  // now h_t = hpart_t
+  h_t.ApplyFloor(0.0);
+  // now h_t = \relu(hpart_t)
+
+  c_t.CopyFromMat(h_t);
+  // now c_t = h_t
+  c_t.AddMatMatElements(-1.0, z_t, h_t, 1.0);
+  // now c_t = (1 - z_t) \dot h_t.
+  c_t.AddMatMatElements(1.0, z_t, c_t1, 1.0);
+  // now c_t = (1 - z_t) \dot h_t  +  z_t \dot c_{t-1}.
+  return NULL;
+}
+
+void MgruInputProjectionNonlinearityComponent::Backprop(
+    const std::string &debug_info,
+    const ComponentPrecomputedIndexes *, // indexes
+    const CuMatrixBase<BaseFloat> &in_value,
+    const CuMatrixBase<BaseFloat> &out_value,
+    const CuMatrixBase<BaseFloat> &out_deriv,
+    void *memo,
+    Component *to_update_in,
+    CuMatrixBase<BaseFloat> *in_deriv) const {
+  KALDI_ASSERT(SameDim(out_value, out_deriv) &&
+               in_value.NumRows() == out_value.NumRows() &&
+               in_value.NumCols() == InputDim() &&
+               out_value.NumCols() == OutputDim() &&
+               (in_deriv == NULL || SameDim(in_value, *in_deriv)) &&
+               memo == NULL);
+  MgruInputProjectionNonlinearityComponent *to_update =
+      dynamic_cast<MgruInputProjectionNonlinearityComponent*>(to_update_in);
+  KALDI_ASSERT(in_deriv != NULL || to_update != NULL);
+  int32 num_rows = in_value.NumRows(),
+      c = cell_dim_;
+
+  // To understand what's going on here, compare this code with the
+  // corresponding 'forward' code in Propagate().
+
+
+  CuSubMatrix<BaseFloat> z_t(in_value, 0, num_rows, 0, c),
+      hpart_t(in_value, 0, num_rows, c, c),
+      c_t1(in_value, 0, num_rows, c + c, c);
+
+  // The purpose of this 'in_deriv_ptr' is so that we can create submatrices
+  // like z_t_deriv without the code crashing.  If in_deriv is NULL these point
+  // to 'in_value', and we'll be careful never to actually write to these
+  // sub-matrices, which aside from being conceptually wrong would violate the
+  // const semantics of this function.
+  const CuMatrixBase<BaseFloat> *in_deriv_ptr =
+      (in_deriv == NULL ? &in_value : in_deriv);
+  CuSubMatrix<BaseFloat> z_t_deriv(*in_deriv_ptr, 0, num_rows, 0, c),
+      hpart_t_deriv(*in_deriv_ptr, 0, num_rows, c, c),
+      c_t1_deriv(*in_deriv_ptr, 0, num_rows, c + c, c);
+
+  // Note: the output h_t is never actually used in the GRU computation (we only
+  // output it because we want the value to be cached to save computation in the
+  // backprop), so we expect that the 'h_t_deriv', if we extracted it in the
+  // obvious way, would be all zeros.
+  // We create a different, local h_t_deriv
+  // variable that backpropagates the derivative from c_t_deriv.
+  CuSubMatrix<BaseFloat> h_t(out_value, 0, num_rows, 0, c),
+      c_t(out_value, 0, num_rows, c, c),
+      c_t_deriv(out_deriv, 0, num_rows, c, c);
+  CuMatrix<BaseFloat> h_t_deriv(num_rows, c, kUndefined);
+
+  {  // we initialize h_t_deriv with the derivative from 'out_deriv'.
+    // In real life in a GRU, this would always be zero; but in testing
+    // code it may be nonzero and we include this term so that
+    // the tests don't fail.  Note: if you were to remove these
+    // lines, you'd have to change 'h_t_deriv.AddMat(1.0, c_t_deriv);' below
+    // to a CopyFromMat() call.
+    CuSubMatrix<BaseFloat> h_t_deriv_in(out_deriv, 0, num_rows, 0, c);
+    h_t_deriv.CopyFromMat(h_t_deriv_in);
+  }
+
+
+  { // This block does the
+    // backprop corresponding to the
+    // forward-pass expression: c_t = (1 - z_t) \dot h_t + z_t \dot c_{t-1}.
+
+    // First do: h_t_deriv = c_t_deriv \dot (1 - z_t).
+    h_t_deriv.AddMat(1.0, c_t_deriv);
+    h_t_deriv.AddMatMatElements(-1.0, c_t_deriv, z_t, 1.0);
+
+    if (in_deriv) {
+      // these should be self-explanatory if you study
+      // the expression "c_t = (1 - z_t) \dot h_t + z_t \dot c_{t-1}".
+      z_t_deriv.AddMatMatElements(-1.0, c_t_deriv, h_t, 1.0);
+      z_t_deriv.AddMatMatElements(1.0, c_t_deriv, c_t1, 1.0);
+      c_t1_deriv.AddMatMatElements(1.0, c_t_deriv, z_t, 1.0);
+    }
+  }
+
+  // do ReLU diff for hpart_t_deriv
+  hpart_t_deriv.Heaviside(h_t);
+  hpart_t_deriv.MulElements(h_t_deriv);
+}
+
+void MgruInputProjectionNonlinearityComponent::Read(std::istream &is, bool binary) {
+  ReadUpdatableCommon(is, binary);
+  ExpectToken(is, binary, "<CellDim>");
+  ReadBasicType(is, binary, &cell_dim_);
+  ExpectToken(is, binary, "</MgruInputProjectionNonlinearityComponent>");
+}
+
+void MgruInputProjectionNonlinearityComponent::Write(std::ostream &os, bool binary) const {
+  WriteUpdatableCommon(os, binary);
+  WriteToken(os, binary, "<CellDim>");
+  WriteBasicType(os, binary, cell_dim_);
+
+  WriteToken(os, binary, "</MgruInputProjectionNonlinearityComponent>");
+}
+
+void MgruInputProjectionNonlinearityComponent::Check() const {
+  KALDI_ASSERT(cell_dim_ > 0);
+}
+
+MgruInputProjectionNonlinearityComponent::MgruInputProjectionNonlinearityComponent(
+    const MgruInputProjectionNonlinearityComponent &other):
+    UpdatableComponent(other),
+    cell_dim_(other.cell_dim_){
   Check();
 }
 

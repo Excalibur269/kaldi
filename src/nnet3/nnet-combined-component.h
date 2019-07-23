@@ -1101,6 +1101,137 @@ class OutputGruNonlinearityComponent: public UpdatableComponent {
       = (const OutputGruNonlinearityComponent &other); // Disallow.
 };
 
+/**
+  MgruInputProjectionNonlinearityComponent is a component that implements part of a
+  Minimal Gated Recurrent Unit Input Projection(mGRUIP).  Compare with the traditional GRU, it uses
+  input projection gate instead reset gate, and the formula of h_t will be different. 
+  You can regard it as a variant of GRU.
+  This code is more efficient in time and memory than stitching it together
+  using more basic components.
+  For a brief summary of what this actually computes, search for 'recap' below;
+  the first part of this comment establishes the context. For more information
+  about GRU, please check the summary of GruNonlinearityComponent.
+
+ Before describing what this component does, we'll establish
+ some notation for the mGRUIP.
+
+ We use the same notation with previous GRU. We'll also
+ ignore the bias terms for purposes of this exposition (let them be implicit).
+
+
+  mGRUIP:
+
+   v_t = x_t * W^v1 + y_{t-1} * W^v2 # input project, dim == ip_dim
+   z_t = \sigmoid ( \batchnorm (v_t1 * W^z) + v_t2 * W^z ) # update gate, dim == cell_dim
+   h_t = \relu( \batchnorm ( v_t * W^h )) # dim == cell_dim
+   y_t = ( 1 - z_t ) \dot h_t + z_t \dot y_{t-1} # dim == cell_dim
+
+   Because we'll need it below, we define
+    hpart_t = \batchnorm ( v_t * W^h )
+   which is a subexpression of h_t.
+
+   Our choice to make a "special" component for the mGRUIP is to have
+   it be a function from
+     (z_t, hpart_t, y_{t-1}) -> (h_t, y_t)
+   That is, the input to the component is all those things on the LHS
+   appended together, and the output is the two things on the
+   RHS appended together.  The dimensions are:
+    (cell_dim, cell_dim, cell_dim) -> (cell_dim, cell_dim).
+   The component computes the functions:
+    h_t = \relu(hpart_t)
+    y_t = ( 1 - z_t ) \dot h_t + z_t \dot y_{t-1}
+
+
+   You might also notice that the output 'h_t' is never actually used
+   in any other part of the GRU, so the question arises: why is it
+   necessary to have it be an output of the component?  This has to do with
+   saving computation: because h_t is an output, and we'll be defining
+   the kBackpropNeedsOutput flag, it is available in the backprop phase
+   and this helps us avoid some computation (otherwise we'd have to do
+   a redundant multiplication by W^h in the backprop phase that we already
+   did in the forward phase).  We could have used the 'memo' mechanism to
+   do this, but this is undesirable because the use of a memo disables
+   'update consolidation' in the backprop so we'd lose a little
+   speed there.
+
+   This component stores stats of the same form as are normally stored by the
+   StoreStats() functions for the sigmoid and tanh units, i.e. averages of the
+   activations and derivatives, but this is done inside the Backprop() functions.
+
+
+  The main configuration values that are accepted:
+         cell-dim         e.g. cell-dim=1024  Cell dimension.
+
+   Recap of what this computes:
+     This component implements the function
+        (z_t, hpart_t, y_{t-1}) -> (h_t, y_t)
+     of dimensions
+        (cell_dim, cell_dim, cell_dim) -> (cell_dim, cell_dim),
+    where:
+    h_t = \relu(hpart_t)
+    y_t = ( 1 - z_t ) \dot h_t + z_t \dot y_{t-1}.
+*/
+class MgruInputProjectionNonlinearityComponent: public Component {
+ public:
+
+  virtual int32 InputDim() const;
+  virtual int32 OutputDim() const;
+  virtual std::string Info() const;
+  virtual void InitFromConfig(ConfigLine *cfl);
+  MgruInputProjectionNonlinearityComponent() { }
+  virtual std::string Type() const { return "MgruInputProjectionNonlinearityComponent"; }
+  virtual int32 Properties() const {
+    return kSimpleComponent|kBackpropNeedsInput|kBackpropNeedsOutput|kBackpropAdds;
+  }
+  virtual void* Propagate(const ComponentPrecomputedIndexes *indexes,
+                         const CuMatrixBase<BaseFloat> &in,
+                         CuMatrixBase<BaseFloat> *out) const;
+  virtual void Backprop(const std::string &debug_info,
+                        const ComponentPrecomputedIndexes *indexes,
+                        const CuMatrixBase<BaseFloat> &in_value,
+                        const CuMatrixBase<BaseFloat> &, // out_value,
+                        const CuMatrixBase<BaseFloat> &out_deriv,
+                        void *memo,
+                        Component *to_update_in,
+                        CuMatrixBase<BaseFloat> *in_deriv) const;
+
+  virtual void Read(std::istream &is, bool binary);
+  virtual void Write(std::ostream &os, bool binary) const;
+
+  virtual Component* Copy() const { return new MgruInputProjectionNonlinearityComponent(*this); }
+
+  // Some functions that are specific to this class:
+  explicit MgruInputProjectionNonlinearityComponent(
+      const MgruInputProjectionNonlinearityComponent &other);
+
+ private:
+
+  void Check() const;  // checks dimensions, etc.
+
+  int32 cell_dim_;  // cell dimension, e.g. 1024.
+
+  // Of dimension cell_dim_, this is comparable to the value_sum_ vector in
+  // class NonlinearComponent.  It stores the sum of the tanh nonlinearity.
+  // Normalize by dividing by count_.
+  // CuVector<double> value_sum_;
+
+  // Of dimension cell_dim_, this is comparable to the deriv_sum_ vector in
+  // class NonlinearComponent.  It stores the sum of the function-derivative of
+  // the tanh nonlinearity.  Normalize by dividing by count_.
+  // CuVector<double> deriv_sum_;
+
+  // This is part of the stats (along with value_sum_, deriv_sum_, and count_);
+  // if you divide it by count_ it gives you the proportion of the time that an
+  // average dimension was subject to self-repair.
+  // double self_repair_total_;
+
+  // The total count (number of frames) corresponding to the stats in value_sum_,
+  // deriv_sum_, and self_repair_total_.
+  // double count_;
+
+  const MgruInputProjectionNonlinearityComponent &operator
+      = (const MgruInputProjectionNonlinearityComponent &other); // Disallow.
+};
 
 } // namespace nnet3
 } // namespace kaldi
