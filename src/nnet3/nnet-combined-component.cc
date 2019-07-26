@@ -2475,17 +2475,15 @@ void MgruInputProjectionNonlinearityComponent::Backprop(
 }
 
 void MgruInputProjectionNonlinearityComponent::Read(std::istream &is, bool binary) {
-  ReadUpdatableCommon(is, binary);
-  ExpectToken(is, binary, "<CellDim>");
+  ExpectOneOrTwoTokens(is, binary, "<MgruInputProjectionNonlinearityComponent>", "<CellDim>");
   ReadBasicType(is, binary, &cell_dim_);
   ExpectToken(is, binary, "</MgruInputProjectionNonlinearityComponent>");
 }
 
 void MgruInputProjectionNonlinearityComponent::Write(std::ostream &os, bool binary) const {
-  WriteUpdatableCommon(os, binary);
+  WriteToken(os, binary, "<MgruInputProjectionNonlinearityComponent>");
   WriteToken(os, binary, "<CellDim>");
   WriteBasicType(os, binary, cell_dim_);
-
   WriteToken(os, binary, "</MgruInputProjectionNonlinearityComponent>");
 }
 
@@ -2495,7 +2493,6 @@ void MgruInputProjectionNonlinearityComponent::Check() const {
 
 MgruInputProjectionNonlinearityComponent::MgruInputProjectionNonlinearityComponent(
     const MgruInputProjectionNonlinearityComponent &other):
-    UpdatableComponent(other),
     cell_dim_(other.cell_dim_){
   Check();
 }
