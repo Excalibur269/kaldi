@@ -122,13 +122,13 @@ class XconfigGruLayer(XconfigLayerBase):
         configs = []
         configs.append("# Update gate control : W_z* matrics")
         configs.append("component name={0}.W_z.xs_z type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + cell_dim, cell_dim, affine_str))
-        
+
         configs.append("# Reset gate control : W_r* matrics")
         configs.append("component name={0}.W_z.xs_r type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + cell_dim, cell_dim, affine_str))
 
         configs.append("# h related matrix : W_h* matrics")
         configs.append("component name={0}.W_h.UW type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + cell_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.r type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
@@ -149,12 +149,12 @@ class XconfigGruLayer(XconfigLayerBase):
         configs.append("# r_t")
         configs.append("component-node name={0}.r_t_pre component={0}.W_z.xs_r input=Append({1}, IfDefined(Offset({2}, {3})))".format(name, input_descriptor, recurrent_connection, delay))
         configs.append("component-node name={0}.r_t component={0}.r input={0}.r_t_pre".format(name))
-        
+
         configs.append("# h_t")
         configs.append("component-node name={0}.h1_t component={0}.h1 input=Append({0}.r_t, IfDefined(Offset({1}, {2})))".format(name, recurrent_connection, delay))
         configs.append("component-node name={0}.h_t_pre component={0}.W_h.UW input=Append({1}, {0}.h1_t)".format(name, input_descriptor))
         configs.append("component-node name={0}.h_t component={0}.h input={0}.h_t_pre".format(name))
-        
+
         configs.append("# y_t")
         configs.append("# The following two lines are to implement (1 - z_t)")
         configs.append("component-node name={0}.y1_t component={0}.y1 input=Append({0}.h_t, Sum(Scale(-1.0,{0}.z_t), Const(1.0, {1})))".format(name, cell_dim))
@@ -316,17 +316,17 @@ class XconfigPgruLayer(XconfigLayerBase):
         # h_t = ( 1 - z_t ) \dot \tilde{h}_t + z_t \dot h_{t-1}
         # y_t = h_t * W^y
         # s_t = y_t (0:rec_proj_dim-1)
-        
+
         configs = []
         configs.append("# Update gate control : W_z* matrics")
         configs.append("component name={0}.W_z.xs_z type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, cell_dim, affine_str))
-        
+
         configs.append("# Reset gate control : W_r* matrics")
         configs.append("component name={0}.W_z.xs_r type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, rec_proj_dim, affine_str))
 
         configs.append("# h related matrix : W_h* matrics")
         configs.append("component name={0}.W_h.UW type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.r type=SigmoidComponent dim={1} {2}".format(name, rec_proj_dim, repair_nonlin_str))
@@ -356,7 +356,7 @@ class XconfigPgruLayer(XconfigLayerBase):
 
         configs.append("component-node name={0}.y1_t component={0}.y1 input=Append({0}.h_t, Sum(Scale(-1.0,{0}.z_t), Const(1.0, {1})))".format(name, cell_dim))
         configs.append("component-node name={0}.y2_t component={0}.y2 input=Append(IfDefined(Offset({1}, {2})), {0}.z_t)".format(name, recurrent_connection_y, delay))
-        
+
         configs.append("component-node name={0}.y_t component={0}.y input=Sum({0}.y1_t, {0}.y2_t)".format(name))
 
         configs.append("# s_t recurrent")
@@ -513,7 +513,7 @@ class XconfigNormPgruLayer(XconfigLayerBase):
         affine_str = self.config['ng-affine-options']
         pes_str = self.config['ng-per-element-scale-options']
         dropout_proportion = self.config['dropout-proportion']
-        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false' 
+        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false'
 
         # Natural gradient per element scale parameters
         # TODO: decide if we want to keep exposing these options
@@ -529,17 +529,17 @@ class XconfigNormPgruLayer(XconfigLayerBase):
         # y_t_tmp = h_t * W^y
         # s_t = renorm ( y_t_tmp (0:rec_proj_dim-1) )
         # y_t = batchnorm ( y_t_tmp )
-        
+
         configs = []
         configs.append("# Update gate control : W_z* matrics")
         configs.append("component name={0}.W_z.xs_z type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, cell_dim, affine_str))
-        
+
         configs.append("# Reset gate control : W_r* matrics")
         configs.append("component name={0}.W_z.xs_r type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, rec_proj_dim, affine_str))
 
         configs.append("# h related matrix : W_h* matrics")
         configs.append("component name={0}.W_h.UW type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, cell_dim , affine_str))
-        
+
         if dropout_proportion != -1.0:
             configs.append("component name={0}.dropout_z type=DropoutComponent dim={1} "
                            "dropout-proportion={2} dropout-per-frame={3}"
@@ -547,7 +547,7 @@ class XconfigNormPgruLayer(XconfigLayerBase):
             configs.append("component name={0}.dropout_r type=DropoutComponent dim={1} "
                            "dropout-proportion={2} dropout-per-frame={3}"
                            .format(name, rec_proj_dim, dropout_proportion, dropout_per_frame))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.r type=SigmoidComponent dim={1} {2}".format(name, rec_proj_dim, repair_nonlin_str))
@@ -574,7 +574,7 @@ class XconfigNormPgruLayer(XconfigLayerBase):
         configs.append("component-node name={0}.r_t_pre component={0}.W_z.xs_r input=Append({1}, IfDefined(Offset({2}, {3})))".format(name, input_descriptor, recurrent_connection, delay))
         if dropout_proportion != -1.0:
             configs.append("component-node name={0}.r_predrop_t component={0}.r input={0}.r_t_pre".format(name))
-            configs.append("component-node name={0}.r_t component={0}.dropout_r input={0}.r_predrop_t".format(name))            
+            configs.append("component-node name={0}.r_t component={0}.dropout_r input={0}.r_predrop_t".format(name))
         else:
             configs.append("component-node name={0}.r_t component={0}.r input={0}.r_t_pre".format(name))
 
@@ -590,7 +590,7 @@ class XconfigNormPgruLayer(XconfigLayerBase):
         configs.append("# s_t recurrent")
         configs.append("component name={0}.W_s.ys type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, cell_dim, rec_proj_dim + nonrec_proj_dim, affine_str))
         configs.append("component name={0}.s_r type=BackpropTruncationComponent dim={1} {2}".format(name, rec_proj_dim, bptrunc_str))
-        
+
         configs.append("component name={0}.batchnorm type=BatchNormComponent dim={1} target-rms=1.0".format(name, rec_proj_dim + nonrec_proj_dim))
         configs.append("component name={0}.renorm type=NormalizeComponent dim={1} target-rms=1.0".format(name, rec_proj_dim))
 
@@ -750,18 +750,18 @@ class XconfigOpgruLayer(XconfigLayerBase):
         # h_t = ( 1 - z_t ) \dot \tilde{h}_t + z_t \dot h_{t-1}
         # y_t = (y_t \dot o_t) * W^y
         # s_t = y_t(0:rec_proj_dim-1)
-        
+
         configs = []
         configs.append("# Update gate control : W_z* matrics")
         configs.append("component name={0}.W_z.xs_z type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, cell_dim, affine_str))
-        
+
         configs.append("# Output gate control : W_r* matrics")
         configs.append("component name={0}.W_z.xs_o type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim + rec_proj_dim, cell_dim, affine_str))
 
         configs.append("# h related matrix : W_h* matrics")
         configs.append("component name={0}.W_h.UW type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim , cell_dim , affine_str))
         configs.append("component name={0}.W_h.UW_elementwise type=NaturalGradientPerElementScaleComponent dim={1} {2}".format(name, cell_dim , pes_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.o type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
@@ -783,7 +783,7 @@ class XconfigOpgruLayer(XconfigLayerBase):
         configs.append("# o_t")
         configs.append("component-node name={0}.o_t_pre component={0}.W_z.xs_o input=Append({1}, IfDefined(Offset({2}, {3})))".format(name, input_descriptor, recurrent_connection, delay))
         configs.append("component-node name={0}.o_t component={0}.o input={0}.o_t_pre".format(name))
-        
+
         configs.append("# h_t")
         configs.append("component-node name={0}.h_t_pre component={0}.W_h.UW input={1}".format(name, input_descriptor))
         configs.append("component-node name={0}.h_t_pre2 component={0}.W_h.UW_elementwise input=IfDefined(Offset({1}, {2}))".format(name, recurrent_connection_y, delay))
@@ -948,7 +948,7 @@ class XconfigNormOpgruLayer(XconfigLayerBase):
         affine_str = self.config['ng-affine-options']
         pes_str = self.config['ng-per-element-scale-options']
         dropout_proportion = self.config['dropout-proportion']
-        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false' 
+        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false'
 
         l2_regularize = self.config['l2-regularize']
         l2_regularize_option = ('l2-regularize={0} '.format(l2_regularize)
@@ -968,18 +968,18 @@ class XconfigNormOpgruLayer(XconfigLayerBase):
         # y_t_tmp = ( h_t \dot o_t) * W^y
         # s_t = renorm ( y_t_tmp(0:rec_proj_dim-1) )
         # y_t = batchnorm ( y_t_tmp )
-        
+
         configs = []
         configs.append("# Update gate control : W_z* matrics")
         configs.append("component name={0}.W_z.xs_z type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3} {4}".format(name, input_dim + rec_proj_dim, cell_dim, affine_str, l2_regularize_option))
-        
+
         configs.append("# Output gate control : W_r* matrics")
         configs.append("component name={0}.W_z.xs_o type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3} {4}".format(name, input_dim + rec_proj_dim, cell_dim, affine_str, l2_regularize_option))
 
         configs.append("# h related matrix : W_h* matrics")
         configs.append("component name={0}.W_h.UW type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3} {4}".format(name, input_dim , cell_dim , affine_str, l2_regularize_option))
         configs.append("component name={0}.W_h.UW_elementwise type=NaturalGradientPerElementScaleComponent dim={1} {2}".format(name, cell_dim , pes_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.o type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
@@ -1014,7 +1014,7 @@ class XconfigNormOpgruLayer(XconfigLayerBase):
             configs.append("component-node name={0}.o_t component={0}.dropout input={0}.o_predrop_t".format(name))
         else:
             configs.append("component-node name={0}.o_t component={0}.o input={0}.o_t_pre".format(name))
-        
+
         configs.append("# h_t")
         configs.append("component-node name={0}.h_t_pre component={0}.W_h.UW input={1}".format(name, input_descriptor))
         configs.append("component-node name={0}.h_t_pre2 component={0}.W_h.UW_elementwise input=IfDefined(Offset({1}, {2}))".format(name, recurrent_connection_y, delay))
@@ -1142,7 +1142,7 @@ class XconfigFastGruLayer(XconfigLayerBase):
 
         # string for GruNonlinearityComponent
         gru_nonlin_str = self.config['gru-nonlinearity-options']
-        
+
         # formulation like:
         # z_t = \sigmoid ( U^z x_t + W^z y_{t-1} )   # update gate
         # r_t = \sigmoid ( U^r x_t + W^r y_{t-1} )   # reset gate
@@ -1167,11 +1167,11 @@ class XconfigFastGruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t related matrix : W_hpart matrice")
         configs.append("component name={0}.W_hpart.x type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities for z_t and r_t")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.r type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
-        
+
         recurrent_connection = '{0}.s_t'.format(name)
 
         configs.append("# z_t")
@@ -1183,7 +1183,7 @@ class XconfigFastGruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t")
         configs.append("component-node name={0}.hpart_t component={0}.W_hpart.x input={1}".format(name, input_descriptor))
-        
+
         configs.append("# y_t")
         configs.append("# Note: the output of GruNonlinearityComponent is (h_t, c_t), we just get the second half. Otherwise, in non-projection gru layer, y_t = c_t")
         configs.append("component name={0}.gru_nonlin type=GruNonlinearityComponent cell-dim={1} {2}".format(name, cell_dim, gru_nonlin_str))
@@ -1345,7 +1345,7 @@ class XconfigFastPgruLayer(XconfigLayerBase):
 
         # string for GruNonlinearityComponent
         gru_nonlin_str = self.config['gru-nonlinearity-options']
-        
+
         # formulation like:
         # z_t = \sigmoid ( U^z x_t + W^z s_{t-1} )   # update gate
         # r_t = \sigmoid ( U^r x_t + W^r s_{t-1} )   # reset gate
@@ -1353,7 +1353,7 @@ class XconfigFastPgruLayer(XconfigLayerBase):
         # c_t = ( 1 - z_t ) \dot h_t  +  z_t \dot c_{t-1}
         # y_t = W^y c_t  # dim(y_t) = recurrent_dim + non_recurrent_dim.
                          #  This is the output of the GRU.
-        # s_t = y_t[0:recurrent_dim-1]  # dimension range of y_t 
+        # s_t = y_t[0:recurrent_dim-1]  # dimension range of y_t
                                         # dim(s_t) = recurrent_dim.
         # Note:
         # naming convention:
@@ -1374,11 +1374,11 @@ class XconfigFastPgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t related matrix : W_hpart matric")
         configs.append("component name={0}.W_hpart.x type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.r type=SigmoidComponent dim={1} {2}".format(name, rec_proj_dim, repair_nonlin_str))
-        
+
         recurrent_connection = '{0}.s_t'.format(name)
 
         configs.append("# z_t and r_t")
@@ -1389,7 +1389,7 @@ class XconfigFastPgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t")
         configs.append("component-node name={0}.hpart_t component={0}.W_hpart.x input={1}".format(name, input_descriptor))
-        
+
         configs.append("# c_t")
         configs.append("# Note: the output of GruNonlinearityComponent is (h_t, c_t), we use the second half.")
         configs.append("component name={0}.gru_nonlin type=GruNonlinearityComponent cell-dim={1} recurrent-dim={2} {3}".format(name, cell_dim, rec_proj_dim, gru_nonlin_str))
@@ -1555,7 +1555,7 @@ class XconfigFastNormPgruLayer(XconfigLayerBase):
         affine_str = self.config['ng-affine-options']
         pes_str = self.config['ng-per-element-scale-options']
         dropout_proportion = self.config['dropout-proportion']
-        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false' 
+        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false'
 
         # Natural gradient per element scale parameters
         # TODO: decide if we want to keep exposing these options
@@ -1565,7 +1565,7 @@ class XconfigFastNormPgruLayer(XconfigLayerBase):
 
         # string for GruNonlinearityComponent
         gru_nonlin_str = self.config['gru-nonlinearity-options']
-        
+
         # formulation like:
         # z_t = \sigmoid ( U^z x_t + W^z s_{t-1} )   # update gate
         # r_t = \sigmoid ( U^r x_t + W^r s_{t-1} )   # reset gate
@@ -1594,7 +1594,7 @@ class XconfigFastNormPgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t related matrix : W_hpart matric")
         configs.append("component name={0}.W_hpart.x type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.r type=SigmoidComponent dim={1} {2}".format(name, rec_proj_dim, repair_nonlin_str))
@@ -1629,7 +1629,7 @@ class XconfigFastNormPgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t")
         configs.append("component-node name={0}.hpart_t component={0}.W_hpart.x input={1}".format(name, input_descriptor))
-        
+
         configs.append("# c_t")
         configs.append("# Note: the output of GruNonlinearityComponent is (h_t, c_t), we use the second half.")
         configs.append("component name={0}.gru_nonlin type=GruNonlinearityComponent cell-dim={1} recurrent-dim={2} {3}".format(name, cell_dim, rec_proj_dim, gru_nonlin_str))
@@ -1801,7 +1801,7 @@ class XconfigFastOpgruLayer(XconfigLayerBase):
 
         # string for GruNonlinearityComponent
         gru_nonlin_str = self.config['gru-nonlinearity-options']
-        
+
         # formulation like:
         # z_t = \sigmoid ( U^z x_t + W^z s_{t-1} )   # update gate
         # o_t = \sigmoid ( U^o x_t + W^o s_{t-1} )   # reset gate
@@ -1809,7 +1809,7 @@ class XconfigFastOpgruLayer(XconfigLayerBase):
         # c_t = ( 1 - z_t ) \dot h_t  +  z_t \dot c_{t-1}
         # y_t = ( c_t \dot o_t ) W^y  # dim(y_t) = recurrent_dim + non_recurrent_dim.
                                       #  This is the output of the GRU.
-        # s_t = y_t[0:recurrent_dim-1]  # dimension range of y_t 
+        # s_t = y_t[0:recurrent_dim-1]  # dimension range of y_t
                                         # dim(s_t) = recurrent_dim.
         # Note:
         # naming convention:
@@ -1830,11 +1830,11 @@ class XconfigFastOpgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t related matrix : W_hpart matric")
         configs.append("component name={0}.W_hpart.x type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.o type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
-        
+
         recurrent_connection = '{0}.s_t'.format(name)
 
         configs.append("# z_t and o_t")
@@ -1845,7 +1845,7 @@ class XconfigFastOpgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t")
         configs.append("component-node name={0}.hpart_t component={0}.W_hpart.x input={1}".format(name, input_descriptor))
-        
+
         configs.append("# c_t")
         configs.append("# Note: the output of OutputGruNonlinearityComponent is (h_t, c_t), we use the second half.")
         configs.append("component name={0}.gru_nonlin type=OutputGruNonlinearityComponent cell-dim={1} {2}".format(name, cell_dim, gru_nonlin_str))
@@ -2014,7 +2014,7 @@ class XconfigFastNormOpgruLayer(XconfigLayerBase):
         affine_str = self.config['ng-affine-options']
         pes_str = self.config['ng-per-element-scale-options']
         dropout_proportion = self.config['dropout-proportion']
-        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false' 
+        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false'
 
         # Natural gradient per element scale parameters
         # TODO: decide if we want to keep exposing these options
@@ -2024,7 +2024,7 @@ class XconfigFastNormOpgruLayer(XconfigLayerBase):
 
         # string for GruNonlinearityComponent
         gru_nonlin_str = self.config['gru-nonlinearity-options']
-        
+
         # formulation like:
         # z_t = \sigmoid ( U^z x_t + W^z s_{t-1} )   # update gate
         # o_t = \sigmoid ( U^o x_t + W^o s_{t-1} )   # output gate
@@ -2053,7 +2053,7 @@ class XconfigFastNormOpgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t related matrix : W_hpart matric")
         configs.append("component name={0}.W_hpart.x type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.o type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
@@ -2084,7 +2084,7 @@ class XconfigFastNormOpgruLayer(XconfigLayerBase):
 
         configs.append("# hpart_t")
         configs.append("component-node name={0}.hpart_t component={0}.W_hpart.x input={1}".format(name, input_descriptor))
-        
+
         configs.append("# c_t")
         configs.append("# Note: the output of OutputGruNonlinearityComponent is (h_t, c_t), we use the second half.")
         configs.append("component name={0}.gru_nonlin type=OutputGruNonlinearityComponent cell-dim={1} {2}".format(name, cell_dim, gru_nonlin_str))
@@ -2107,7 +2107,7 @@ class XconfigFastNormOpgruLayer(XconfigLayerBase):
         configs.append("# y_t : output")
         configs.append("component name={0}.batchnorm type=BatchNormComponent dim={1} target-rms=1.0".format(name, rec_proj_dim + nonrec_proj_dim))
         configs.append("component-node name={0}.y_t component={0}.batchnorm input={0}.y_t_tmp".format(name))
-        
+
         return configs
 
 # This class is for lines like
@@ -2247,7 +2247,7 @@ class XconfigFastNormOpgrurLayer(XconfigLayerBase):
         affine_str = self.config['ng-affine-options']
         pes_str = self.config['ng-per-element-scale-options']
         dropout_proportion = self.config['dropout-proportion']
-        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false' 
+        dropout_per_frame = 'true' if self.config['dropout-per-frame'] else 'false'
 
         # Natural gradient per element scale parameters
         # TODO: decide if we want to keep exposing these options
@@ -2257,7 +2257,7 @@ class XconfigFastNormOpgrurLayer(XconfigLayerBase):
 
         # string for GruNonlinearityComponent
         gru_nonlin_str = self.config['gru-nonlinearity-options']
-        
+
         # formulation like:
         # z_t = \sigmoid ( U^z x_t + W^z s_{t-1} )   # update gate
         # o_t = \sigmoid ( U^o x_t + W^o s_{t-1} )   # output gate
@@ -2286,7 +2286,7 @@ class XconfigFastNormOpgrurLayer(XconfigLayerBase):
 
         configs.append("# hpart_t related matrix : W_hpart matric")
         configs.append("component name={0}.W_hpart.x type=NaturalGradientAffineComponent input-dim={1} output-dim={2} {3}".format(name, input_dim, cell_dim , affine_str))
-        
+
         configs.append("# Defining the non-linearities")
         configs.append("component name={0}.z type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
         configs.append("component name={0}.o type=SigmoidComponent dim={1} {2}".format(name, cell_dim, repair_nonlin_str))
@@ -2317,7 +2317,7 @@ class XconfigFastNormOpgrurLayer(XconfigLayerBase):
 
         configs.append("# hpart_t")
         configs.append("component-node name={0}.hpart_t component={0}.W_hpart.x input={1}".format(name, input_descriptor))
-        
+
         configs.append("# c_t")
         configs.append("# Note: the output of OutputGruNonlinearityComponent is (h_t, c_t), we use the second half.")
         configs.append("component name={0}.gru_nonlin type=OutputGruNonlinearityComponent cell-dim={1} {2}".format(name, cell_dim, gru_nonlin_str))
@@ -2339,7 +2339,7 @@ class XconfigFastNormOpgrurLayer(XconfigLayerBase):
         configs.append("# y_t : output")
         configs.append("component name={0}.batchnorm type=BatchNormComponent dim={1} target-rms=1.0".format(name, rec_proj_dim))
         configs.append("component-node name={0}.y_t component={0}.batchnorm input={0}.y_t_tmp".format(name))
-        
+
         return configs
 
 # This class is for lines like
@@ -2829,12 +2829,12 @@ class XconfigFastMgruipLayer(XconfigLayerBase):
         configs.append("component-node name={0}.z_t component={0}.z input={0}.z_t_pre".format(name))
 
         configs.append("# hpart_t")
-        configs.append("component-node name={0}.hpart_t_pre component={0}.W_h input={0}.v_t".format(name))
+        configs.append("component-node name={0}.hpart_t_pre component={0}.W_hpart.v input={0}.v_t".format(name))
         configs.append("component-node name={0}.hpart_t component={0}.batchnorm.h input={0}.hpart_t_pre".format(name))
 
         configs.append("# y_t")
-        configs.append("# Note: the output of MgruInputProjectionNonlinearityComponent is (h_t, c_t), we just get the second half.)
-        configs.append("component name={0}.gru_nonlin type=MgruInputProjectionNonlinearityComponent cell-dim={1} {2}".format(name, cell_dim))
+        configs.append("# Note: the output of MgruInputProjectionNonlinearityComponent is (h_t, c_t), we just get the second half.")
+        configs.append("component name={0}.gru_nonlin type=MgruInputProjectionNonlinearityComponent cell-dim={1}".format(name, cell_dim))
         configs.append("component-node name={0}.gru_nonlin_t component={0}.gru_nonlin input=Append({0}.z_t, {0}.hpart_t, IfDefined(Offset({1}, {2})))".format(name, recurrent_connection, delay))
         configs.append("dim-range-node name={0}.y_t input-node={0}.gru_nonlin_t dim-offset={1} dim={1}".format(name, cell_dim))
 
